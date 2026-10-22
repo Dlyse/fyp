@@ -1,0 +1,5 @@
+Hi
+
+this is an adaptation of the repo https://github.com/govindsi/b-rid-esp32, made to work with lolin 32D (a newer esp 32)
+
+certain dependencies has been fixed and some improvement to prevent overflow has been made
