@@ -1,3 +1,5 @@
+#oh lol i didnt know jp ppl worked on this ~hy
+
 
 # OpenDroneID サンプル送信機 for Linux
 

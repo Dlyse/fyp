@@ -18,7 +18,7 @@
 #include <errno.h>
 #include <sys/resource.h>
 #include "ap_interface.h"
-#include "bluetooth.h"
+#include "utils.h"
 #include "wifi_beacon.h"
 #include "gpsmod.h"
 
@@ -131,9 +131,6 @@ static void fill_example_gps_data(struct ODID_UAS_Data *uasData) {
 }
 
 static void cleanup(int exit_code) {
-    if (config.use_btl || config.use_bt4 || config.use_bt5)
-        close_bluetooth(&config);
-
     if (config.use_beacon) {
         send_quit();
 
@@ -160,12 +157,9 @@ static void sig_handler(int signo) {
         kill_program = true;
     }
 }
+
 //this isnt in use ignore
 static void send_message(union ODID_Message_encoded *encoded, struct config_data *config, uint8_t msg_counter) {
-    if (config->use_btl)
-        send_bluetooth_message(encoded, msg_counter, config);
-    if (config->use_bt4 || config->use_bt5)
-        send_bluetooth_message_extended_api(encoded, msg_counter, config);
     if (config->use_beacon)
         send_beacon_message(encoded, msg_counter);
     usleep(100000);
@@ -212,43 +206,7 @@ static void send_single_messages(struct ODID_UAS_Data *uasData, struct config_da
         send_message(&encoded, config, config->msg_counters[ODID_MSG_COUNTER_OPERATOR_ID]++);
     }
 }
-/*
-static void create_message_pack(struct ODID_UAS_Data *uasData, struct ODID_MessagePack_encoded *pack_enc) {
-    union ODID_Message_encoded encoded = { 0 };
-    ODID_MessagePack_data pack_data = { 0 };
-    pack_data.SingleMessageSize = ODID_MESSAGE_SIZE;
-    pack_data.MsgPackSize = 9;
-    if (encodeBasicIDMessage((ODID_BasicID_encoded *) &encoded, &uasData->BasicID[BASIC_ID_POS_ZERO]) != ODID_SUCCESS)
-        printf("Error: Failed to encode Basic ID\n");
-    memcpy(&pack_data.Messages[0], &encoded, ODID_MESSAGE_SIZE);
-    if (encodeBasicIDMessage((ODID_BasicID_encoded *) &encoded, &uasData->BasicID[BASIC_ID_POS_ONE]) != ODID_SUCCESS)
-        printf("Error: Failed to encode Basic ID\n");
-    memcpy(&pack_data.Messages[1], &encoded, ODID_MESSAGE_SIZE);
-    if (encodeLocationMessage((ODID_Location_encoded *) &encoded, &uasData->Location) != ODID_SUCCESS)
-        printf("Error: Failed to encode Location\n");
-    memcpy(&pack_data.Messages[2], &encoded, ODID_MESSAGE_SIZE);
-    if (encodeAuthMessage((ODID_Auth_encoded *) &encoded, &uasData->Auth[0]) != ODID_SUCCESS)
-        printf("Error: Failed to encode Auth 0\n");
-    memcpy(&pack_data.Messages[3], &encoded, ODID_MESSAGE_SIZE);
-    if (encodeAuthMessage((ODID_Auth_encoded *) &encoded, &uasData->Auth[1]) != ODID_SUCCESS)
-        printf("Error: Failed to encode Auth 1\n");
-    memcpy(&pack_data.Messages[4], &encoded, ODID_MESSAGE_SIZE);
-    if (encodeAuthMessage((ODID_Auth_encoded *) &encoded, &uasData->Auth[2]) != ODID_SUCCESS)
-        printf("Error: Failed to encode Auth 2\n");
-    memcpy(&pack_data.Messages[5], &encoded, ODID_MESSAGE_SIZE);
-    if (encodeSelfIDMessage((ODID_SelfID_encoded *) &encoded, &uasData->SelfID) != ODID_SUCCESS)
-        printf("Error: Failed to encode Self ID\n");
-    memcpy(&pack_data.Messages[6], &encoded, ODID_MESSAGE_SIZE);
-    if (encodeSystemMessage((ODID_System_encoded *) &encoded, &uasData->System) != ODID_SUCCESS)
-        printf("Error: Failed to encode System\n");
-    memcpy(&pack_data.Messages[7], &encoded, ODID_MESSAGE_SIZE);
-    if (encodeOperatorIDMessage((ODID_OperatorID_encoded *) &encoded, &uasData->OperatorID) != ODID_SUCCESS)
-        printf("Error: Failed to encode Operator ID\n");
-    memcpy(&pack_data.Messages[8], &encoded, ODID_MESSAGE_SIZE);
-    if (encodeMessagePack(pack_enc, &pack_data) != ODID_SUCCESS)
-        printf("Error: Failed to encode message pack_data\n");
-}
-*/
+
 static void create_message_pack(struct ODID_UAS_Data *uasData, struct ODID_MessagePack_encoded *pack_enc) {
     union ODID_Message_encoded encoded;
     ODID_MessagePack_data pack_data = { 0 };
@@ -284,19 +242,6 @@ static void create_message_pack(struct ODID_UAS_Data *uasData, struct ODID_Messa
         printf("Error: Failed to encode message pack_data\n");
 }
 
-
-// static void send_packs(struct ODID_UAS_Data *uasData, struct config_data *config) {
-//     struct ODID_MessagePack_encoded pack_enc = { 0 };
-//     create_message_pack(uasData, &pack_enc);
-
-//     for (int i = 0; i < 10; i++) {
-//         if (config->use_beacon)
-//             send_beacon_message_pack(&pack_enc, config->msg_counters[ODID_MSG_COUNTER_PACKED]++);
-//         if (config->use_bt5)
-//             send_bluetooth_message_pack(&pack_enc, config->msg_counters[ODID_MSG_COUNTER_PACKED]++, config);
-//         sleep(4);
-//     }
-// }
 static void update_timestamps(struct ODID_UAS_Data *u) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -327,33 +272,24 @@ static void send_packs(struct ODID_UAS_Data *uasData, struct config_data *config
 
         if (config->use_beacon)
             send_beacon_message_pack(&pack_enc, config->msg_counters[ODID_MSG_COUNTER_PACKED]++);
-        if (config->use_bt5)
-            send_bluetooth_message_pack(&pack_enc, config->msg_counters[ODID_MSG_COUNTER_PACKED]++, config);
         usleep(200000);   // was sleep(4); tune this after you measure the real loop rate
     }
 }
 
 void print_help() {
-    printf("Program for transmitting static drone ID data on Wi-Fi Beacon or Bluetooth.\n");
+    printf("Program for transmitting static drone ID data on Wi-Fi Beacon.\n");
     printf("Must be run with sudo rights in order to work.\n");
     printf("Options: b Enable Wi-Fi Beacon transmission\n");
-    printf("         l Enable Bluetooth 4 Legacy Advertising transmission\n");
-    printf("           using the non-Extended Advertising HCI API commands\n");
-    printf("         4 Enable Bluetooth 4 Legacy Advertising transmission\n");
-    printf("           using the Extended Advertising HCI API commands\n");
-    printf("         5 Enable Bluetooth 5 Long Range + Extended Advertising transmission\n");
     printf("         p Use message packs instead of single messages\n");
     printf("         g Use gpsd to dynamically update location messages after each loop of messages\n");
     printf("E.g. sudo ./transmit b p\n\n");
     printf("Wi-Fi Beacon transmit only works when running\n");
     printf("\"sudo hostapd/hostapd/hostapd beacon.conf\" in a separate shell.\n");
     printf("Disconnect from all Wi-Fi networks before starting Wi-Fi Beacon transmission.\n\n");
-    printf("If terminated abnormally, Beacon and Bluetooth broadcasts can remain on.\n");
+    printf("If terminated abnormally, Beacon broadcasts can remain on.\n");
     printf(" - To stop Beacon broadcast, stop the hostapd instance.\n");
     printf("   It can be difficult to stop the transmit instance.\n");
     printf("   After stopping hostapd, use \"sudo pkill transmit\".\n");
-    printf(" - To stop Bluetooth, use \"sudo btmgmt power off\" and then\n");
-    printf("   \"sudo btmgmt power on\".\n");
 }
 
 static void parse_command_line(int argc, char *argv[], struct config_data *config) {
@@ -367,15 +303,6 @@ static void parse_command_line(int argc, char *argv[], struct config_data *confi
             case 'b':
                 config->use_beacon = true;
                 break;
-            case 'l':
-                config->use_btl = true;
-                break;
-            case '4':
-                config->use_bt4 = true;
-                break;
-            case '5':
-                config->use_bt5 = true;
-                break;
             case 'p':
                 config->use_packs = true;
                 break;
@@ -383,6 +310,7 @@ static void parse_command_line(int argc, char *argv[], struct config_data *confi
                 config->use_gps = true;
                 break;
             default:
+             fprintf(stderr, "Ignoring unknown option: %s\n", argv[i]);
                 break;
         }
     }
@@ -391,20 +319,7 @@ static void parse_command_line(int argc, char *argv[], struct config_data *confi
     if (config->use_beacon && !config->use_packs)
         printf("\nWarning: Transmitting single messages on Wi-Fi beacon is violating\nthe standards. Enable message packs.\n\n");
 
-    if (config->use_btl && (config->use_bt4 || config->use_bt5)) {
-        printf("\nError: Cannot use both old API and Extended Advertising API at the same time.\n\n");
-        exit(EXIT_FAILURE);
-    }
-    if ((config->use_btl || config->use_bt4) && config->use_packs) {
-        printf("\nError: BT4 cannot use message packs.\n\n");
-        exit(EXIT_FAILURE);
-    }
-    if (config->use_bt4 && config->use_bt5)
-        printf("\nWarning: Doing simultaneous BT4 and BT5 will not necessarily work.\n\n");
-    if (config->use_bt5 && !config->use_packs)
-        printf("\nWarning: Transmitting single messages on Bluetooth 5 Long Range is violating\nthe standards. Enable message packs.\n\n");
-
-    if (!config->use_beacon && !config->use_btl && !config->use_bt4 && !config->use_bt5) {
+    if (!config->use_beacon ) {
         print_help();
         exit(EXIT_SUCCESS);
     }
@@ -470,9 +385,6 @@ int main(int argc, char *argv[])
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
 
-    config.handle_bt4 = 0; // The Extended Advertising set number used for BT4
-    config.handle_bt5 = 1; // The Extended Advertising set number used for BT5
-
     if (config.use_beacon) {
         sem_init(&semaphore,0,0);
         pthread_create(&id, NULL, ap_interface_init, NULL);
@@ -484,9 +396,6 @@ int main(int argc, char *argv[])
     fill_example_data(&uasData);
     if(!config.use_gps)
         fill_example_gps_data(&uasData);
-
-    if (config.use_btl || config.use_bt4 || config.use_bt5)
-        init_bluetooth(&config);
 
     if(config.use_gps) {
         //signal(SIGINT,  sig_handler);

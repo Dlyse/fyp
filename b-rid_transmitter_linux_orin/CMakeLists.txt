@@ -27,8 +27,7 @@ include_directories(
         hostapd/src
         hostapd/src/utils
         core-c/libopendroneid
-        gpsd/gpsd-dev
-        bluez
+        gpsd/gpsd-dev  
 )
 
 add_executable(transmit
@@ -40,15 +39,11 @@ add_executable(transmit
         hostapd/src/utils/eloop.c
         hostapd/src/utils/wpa_debug.c
         core-c/libopendroneid/opendroneid.c
-        bluez/lib/hci.c
-        bluez/lib/bluetooth.c
         ap_interface.c
         utils.c
-        bluetooth.c
         wifi_beacon.c
         gpsmod.c
         transmit.c
-        print_bt_features.c
 )
 
 target_link_libraries(transmit
