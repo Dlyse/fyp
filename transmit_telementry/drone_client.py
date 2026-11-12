@@ -2,17 +2,18 @@
 Runs on the Orin. Pushes PX4 telemetry, the planned route and a compressed
 depth image (+ obstacle summary) to the relay server over a websocket.
 
-pip install mavsdk websockets opencv-python numpy pyrealsense2
+pip install "mavsdk<4" websockets opencv-python numpy pyrealsense2
 (pyrealsense2 has no aarch64 wheel on some JetPack versions: build librealsense
 with CUDA/RSUSB per Intel's Jetson guide. Use FAKE_DEPTH=1 to test without cameras.)
 
 Env vars:
   SERVER_URL  ws://<server-ip>:8000/ws/drone   (use wss:// once you have TLS)
   DRONE_TOKEN same secret as the server
-  MAV_ADDR    udp://:14540  (PX4 SITL / mavlink-router)  or  serial:///dev/ttyTHS1:921600
+  MAV_ADDR    udpin://0.0.0.0:14540  (PX4 SITL / mavlink-router)  or  serial:///dev/ttyTHS1:921600
 """
 import asyncio
 import json
+import math
 import os
 import time
 
@@ -24,7 +25,7 @@ from mavsdk import System
 
 SERVER_URL = os.environ.get("SERVER_URL", "ws://192.168.1.50:8000/ws/drone")
 TOKEN = os.environ.get("DRONE_TOKEN", "change-me")
-MAV_ADDR = os.environ.get("MAV_ADDR", "udp://:14540")
+MAV_ADDR = os.environ.get("MAV_ADDR", "udpin://0.0.0.0:14540")
 
 TELEMETRY_HZ = 2
 OBS_HZ = 5                # obstacle summary rate, per camera
@@ -50,6 +51,7 @@ RS_W, RS_H, RS_FPS = 424, 240, 15   # depth only: keeps 5 cameras inside USB ban
 FAKE_DEPTH = os.environ.get("FAKE_DEPTH") == "1"
 
 latest: dict = {}   # camera name -> newest uint16 depth image in mm
+ACTIVE: list = []   # (name, role) of cameras actually started; only these are sent
 
 
 def realsense_reader(name, serial):
@@ -90,7 +92,8 @@ def fake_reader(name, i):
 
 def start_cameras():
     if FAKE_DEPTH:
-        for i, (name, _, _) in enumerate(CAMERAS):
+        for i, (name, role, _) in enumerate(CAMERAS):
+            ACTIVE.append((name, role))
             threading.Thread(target=fake_reader, args=(name, i), daemon=True).start()
         return
     import pyrealsense2 as rs
@@ -103,6 +106,7 @@ def start_cameras():
             print(f"{name}: no camera available")
             continue
         print(f"{name} -> {serial}")
+        ACTIVE.append((name, role))
         threading.Thread(target=realsense_reader, args=(name, serial), daemon=True).start()
         time.sleep(1)   # stagger USB start-up
 
@@ -189,12 +193,12 @@ async def send_state(ws):
 
 
 async def send_depth(ws):
-    await ws.send(json.dumps({"type": "cameras", "names": [c[0] for c in CAMERAS]}))
+    await ws.send(json.dumps({"type": "cameras", "names": [c[0] for c in ACTIVE]}))
     last_img = {}
     while True:
         t0 = time.time()
         jobs = []
-        for idx, (name, role, _) in enumerate(CAMERAS):
+        for idx, (name, role) in enumerate(ACTIVE):
             frame = latest.get(name)
             if frame is None:
                 continue
@@ -231,10 +235,40 @@ async def run_link():
             backoff = min(backoff * 2, 15)
 
 
+async def fake_px4():
+    """NO_PX4=1: fake telemetry and route so the link can be tested without a flight controller."""
+    global route
+    lat0, lon0 = 1.3000, 103.8000
+    route = [[lat0 + dy, lon0 + dx, 20.0]
+             for dx, dy in ((0, 0), (0.0006, 0), (0.0006, 0.0006), (0, 0.0006))]
+    t0 = time.time()
+    while True:
+        a = (time.time() - t0) / 20 * 2 * math.pi
+        state.update(
+            pos={"lat": lat0 + 0.0003 + 0.0003 * math.sin(a),
+                 "lon": lon0 + 0.0003 + 0.0003 * math.cos(a), "alt_m": 20.0},
+            att={"roll": 0.0, "pitch": 0.0, "yaw": math.degrees(a) % 360},
+            vel={"n": 0.0, "e": 0.0, "d": 0.0}, batt={"v": 16.0, "pct": 0.8},
+            mode="FAKE", armed=True, in_air=True, gps={"sats": 12, "fix": "FAKE"},
+            mission={"current": 1, "total": 4})
+        await asyncio.sleep(0.5)
+
+
+async def px4_task():
+    """Connect to PX4 in the background so camera data flows even with no flight controller."""
+    try:
+        drone = await start_px4()
+        await refresh_route(drone)
+    except Exception as e:
+        print(f"PX4 task stopped: {e!r}")
+
+
 async def main():
     await asyncio.to_thread(start_cameras)
-    drone = await start_px4()
-    asyncio.create_task(refresh_route(drone))
+    if os.environ.get("NO_PX4") == "1":
+        asyncio.create_task(fake_px4())
+    else:
+        asyncio.create_task(px4_task())
     await run_link()
 
 

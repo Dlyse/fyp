@@ -43,6 +43,8 @@ async def drone_ws(ws: WebSocket, token: str = ""):
         await ws.close(code=1008)
         return
     await ws.accept()
+    last_json.clear()
+    last_frames.clear()
     print("drone connected")
     try:
         while True:
