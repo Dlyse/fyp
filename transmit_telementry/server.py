@@ -3,6 +3,8 @@ Relay server: drone connects OUT to /ws/drone, browsers connect to /ws/view.
 Run:  DRONE_TOKEN=yourSecret uvicorn server:app --host 0.0.0.0 --port 8000
 Open: http://<server-ip>:8000/
 """
+from __future__ import annotations
+
 import json
 import os
 
