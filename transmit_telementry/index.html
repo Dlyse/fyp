@@ -23,7 +23,7 @@
   <div class="card" style="grid-column: 1 / -1"><div>Depth cameras</div><div id="cams" class="cams"></div></div>
   <div class="card" style="grid-column: 1 / -1">
     <div>3D view <select id="sel3d"><option value="">off</option></select>
-    <small>(drag to rotate, wheel to zoom; blue = near, red = far)</small></div>
+    <small>(drag to rotate, wheel to zoom)</small></div>
     <canvas id="c3d" width="800" height="450"></canvas>
   </div>
   <div class="card"><div>Route</div><canvas id="map" width="400" height="300"></canvas></div>
@@ -111,22 +111,22 @@ function sendView() {
 }
 $("sel3d").onchange = e => { want3d = e.target.value; if (!want3d) cloud = null; sendView(); render(); };
 
-function heat(t) {
-  t = Math.min(Math.max(t, 0), 1);
-  const h = (1 - t) * 4, i = Math.min(Math.floor(h), 3), f = h - i;
-  const [r, g, b] = [[1, f, 0], [1 - f, 1, 0], [0, 1, f], [0, 1 - f, 1]][i];
-  return ((255 << 24) | ((b * 255 | 0) << 16) | ((g * 255 | 0) << 8) | (r * 255 | 0)) >>> 0;
+async function decode(bytes, type, w, h) {
+  const bmp = await createImageBitmap(new Blob([bytes], { type }), { colorSpaceConversion: "none" });
+  const oc = document.createElement("canvas");
+  oc.width = w; oc.height = h;
+  const og = oc.getContext("2d", { willReadFrequently: true });
+  og.drawImage(bmp, 0, 0, w, h);
+  return og.getImageData(0, 0, w, h).data;
 }
 
-async function showCloud(cam, png) {
+async function showCloud(cam, bytes) {
   const m = meta3d[cam];
   if (!m) return;
-  const bmp = await createImageBitmap(new Blob([png], { type: "image/png" }), { colorSpaceConversion: "none" });
-  const oc = document.createElement("canvas");
-  oc.width = m.w; oc.height = m.h;
-  const og = oc.getContext("2d", { willReadFrequently: true });
-  og.drawImage(bmp, 0, 0);
-  const px = og.getImageData(0, 0, m.w, m.h).data;
+  const n1 = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(0);
+  const png = bytes.subarray(4, 4 + n1), jpg = bytes.subarray(4 + n1);
+  const px = await decode(png, "image/png", m.w, m.h);
+  const cpx = jpg.length ? await decode(jpg, "image/jpeg", m.w, m.h) : null;
   const pts = new Float32Array(m.w * m.h * 3), col = new Uint32Array(m.w * m.h);
   let n = 0;
   for (let v = 0; v < m.h; v++) for (let u = 0; u < m.w; u++) {
@@ -135,7 +135,10 @@ async function showCloud(cam, png) {
     pts[n * 3] = (u - m.cx) * d / m.fx;
     pts[n * 3 + 1] = -(v - m.cy) * d / m.fy;
     pts[n * 3 + 2] = d;
-    col[n++] = heat(d / 6);
+    // real colour (grey by distance if no colour), dimmed slightly with distance for depth cue
+    const s = 1 - 0.35 * Math.min(d / 6, 1);
+    const r = cpx ? cpx[i] * s : 255 * s, g = cpx ? cpx[i + 1] * s : 255 * s, b = cpx ? cpx[i + 2] * s : 255 * s;
+    col[n++] = ((255 << 24) | ((b | 0) << 16) | ((g | 0) << 8) | (r | 0)) >>> 0;
   }
   cloud = { pts, col, n };
   render();

@@ -14,6 +14,7 @@ Env vars:
 import asyncio
 import json
 import math
+import struct
 import os
 import time
 
@@ -49,29 +50,47 @@ CAMERAS = [  # (name, role, serial). Leave serial "" to auto-assign in plug-in o
 ]
 RS_W, RS_H, RS_FPS = 424, 240, 15   # depth only: keeps 5 cameras inside USB bandwidth
 FAKE_DEPTH = os.environ.get("FAKE_DEPTH") == "1"
+USE_COLOR = os.environ.get("USE_COLOR", "1") == "1"   # RGB for the 3D view; 0 = depth only
 
 latest: dict = {}   # camera name -> newest uint16 depth image in mm
 INTR: dict = {}     # camera name -> (fx, fy, cx, cy) at native resolution
 view3d = None       # camera the website wants as a 3D point cloud (None = off)
 DEPTH3D_HZ = 2
+latest_color: dict = {}  # camera name -> (timestamp, BGR image aligned to the depth image)
 ACTIVE: list = []   # (name, role) of cameras actually started; only these are sent
 
 
 def realsense_reader(name, serial):
     import pyrealsense2 as rs
+    align = rs.align(rs.stream.depth)   # resample colour onto the depth image
+    use_color = USE_COLOR
     while True:
         pipe = rs.pipeline()
         try:
             cfg = rs.config()
             cfg.enable_device(serial)
             cfg.enable_stream(rs.stream.depth, RS_W, RS_H, rs.format.z16, RS_FPS)
-            prof = pipe.start(cfg)
+            if use_color:
+                cfg.enable_stream(rs.stream.color, RS_W, RS_H, rs.format.bgr8, RS_FPS)
+            try:
+                prof = pipe.start(cfg)
+            except Exception as e:
+                if not use_color:
+                    raise
+                print(f"{name}: colour stream unavailable ({e!r}), using depth only")
+                use_color = False
+                continue
             scale = prof.get_device().first_depth_sensor().get_depth_scale()
             k = prof.get_stream(rs.stream.depth).as_video_stream_profile().get_intrinsics()
             INTR[name] = (k.fx, k.fy, k.ppx, k.ppy)
-            print(f"{name}: started ({serial})")
+            print(f"{name}: started ({serial}), colour={'on' if use_color else 'off'}")
             while True:
                 fs = pipe.wait_for_frames(5000)
+                if use_color and view3d == name:      # only align the camera being viewed in 3D
+                    fs = align.process(fs)
+                    c = fs.get_color_frame()
+                    if c:
+                        latest_color[name] = (time.time(), np.asanyarray(c.get_data()).copy())
                 raw = np.asanyarray(fs.get_depth_frame().get_data())
                 if abs(scale - 0.001) > 1e-6:
                     raw = (raw * (scale * 1000)).astype(np.uint16)
@@ -79,6 +98,7 @@ def realsense_reader(name, serial):
         except Exception as e:
             print(f"{name}: camera error {e!r}, restarting")
             latest.pop(name, None)
+            latest_color.pop(name, None)
             try:
                 pipe.stop()
             except Exception:
@@ -94,6 +114,12 @@ def fake_reader(name, i):
     while True:
         d = 2000 + 1500 * np.sin(x / 40.0 + i) + 800 * np.cos(y / 30.0 + time.time())
         latest[name] = d.astype(np.uint16)
+        if view3d == name:   # fake colour image so the 3D colours can be tested
+            c = np.zeros((h, w, 3), np.uint8)
+            c[:, :, 0] = (x * 255 // w).astype(np.uint8)
+            c[:, :, 1] = (y * 255 // h).astype(np.uint8)
+            c[:, :, 2] = 160
+            latest_color[name] = (time.time(), c)
         time.sleep(1 / RS_FPS)
 
 
@@ -119,7 +145,8 @@ def start_cameras():
 
 
 def encode_depth3d(name, depth_mm):
-    """Lossless half-resolution depth as a PNG (R = high byte, G = low byte) plus intrinsics."""
+    """Half-res lossless depth PNG (R = high byte, G = low byte) + optional colour JPEG.
+    Payload = 4-byte PNG length + PNG + JPEG (JPEG empty if no colour)."""
     h, w = depth_mm.shape
     tw, th = w // 2, h // 2
     small = cv2.resize(depth_mm, (tw, th), interpolation=cv2.INTER_NEAREST)
@@ -127,12 +154,22 @@ def encode_depth3d(name, depth_mm):
     img[:, :, 2] = small >> 8
     img[:, :, 1] = small & 255
     ok, png = cv2.imencode(".png", img, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+    jpg = b""
+    c = latest_color.get(name)
+    if c and time.time() - c[0] < 1.0:
+        col = cv2.resize(c[1], (tw, th), interpolation=cv2.INTER_AREA)
+        ok2, j = cv2.imencode(".jpg", col, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        if ok2:
+            jpg = j.tobytes()
     f = (w / 2) / math.tan(math.radians(43.5))
     fx, fy, cx, cy = INTR.get(name, (f, f, w / 2, h / 2))
     s = tw / w
-    meta = {"type": "depth3d", "cam": name, "w": tw, "h": th,
+    meta = {"type": "depth3d", "cam": name, "w": tw, "h": th, "color": bool(jpg),
             "fx": fx * s, "fy": fy * s, "cx": cx * s, "cy": cy * s}
-    return meta, (png.tobytes() if ok else None)
+    if not ok:
+        return meta, None
+    png = png.tobytes()
+    return meta, struct.pack(">I", len(png)) + png + jpg
 
 
 def _near(a: np.ndarray):
@@ -154,8 +191,8 @@ def process_depth(name, role, depth_mm, want_image):
     if not want_image:
         return summary, None
     small = cv2.resize(depth_mm, IMG_SIZE, interpolation=cv2.INTER_NEAREST)
-    vis = np.clip(small.astype(np.float32) / DEPTH_MAX_MM * 255, 0, 255).astype(np.uint8)
-    vis = cv2.applyColorMap(vis, cv2.COLORMAP_TURBO)
+    # greyscale: near = bright, far = dark, no reading = black
+    vis = (255 - np.clip(small.astype(np.float32) / DEPTH_MAX_MM * 225, 0, 225)).astype(np.uint8)
     vis[small == 0] = 0
     ok, jpg = cv2.imencode(".jpg", vis, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
     return summary, (jpg.tobytes() if ok else None)
