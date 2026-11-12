@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Drone link</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 16px; background: #111; color: #eee; }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  #status { padding: 2px 8px; border-radius: 10px; background: #a33; font-size: 13px; }
+  #status.up { background: #2a7; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+  .card { background: #1c1c1c; border-radius: 8px; padding: 12px; }
+  img, canvas { width: 100%; background: #000; border-radius: 4px; image-rendering: pixelated; }
+  .cams { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; }
+  .cam div { font-size: 12px; }
+  pre { margin: 0; font-size: 13px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>Drone link <span id="status">offline</span></h1>
+<div class="grid">
+  <div class="card" style="grid-column: 1 / -1"><div>Depth cameras</div><div id="cams" class="cams"></div></div>
+  <div class="card"><div>Route</div><canvas id="map" width="400" height="300"></canvas></div>
+  <div class="card"><div>Telemetry</div><pre id="tel"></pre></div>
+</div>
+<script>
+let route = [], pos = null, lastUrls = {}, lastMsg = 0;
+const $ = id => document.getElementById(id);
+
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/ws/view`);
+  ws.binaryType = "arraybuffer";
+  ws.onclose = () => { setTimeout(connect, 2000); };
+  ws.onmessage = ev => {
+    lastMsg = Date.now();
+    if (typeof ev.data !== "string") {
+      const b = new Uint8Array(ev.data);
+      const img = $("img-" + b[0]);
+      if (!img) return;
+      const url = URL.createObjectURL(new Blob([b.subarray(1)], { type: "image/jpeg" }));
+      img.src = url;
+      if (lastUrls[b[0]]) URL.revokeObjectURL(lastUrls[b[0]]);
+      lastUrls[b[0]] = url;
+      return;
+    }
+    const m = JSON.parse(ev.data);
+    if (m.type === "telemetry") {
+      pos = m.pos || null;
+      $("tel").textContent = JSON.stringify(m, null, 2);
+      drawMap();
+    } else if (m.type === "route") {
+      route = m.points; drawMap();
+    } else if (m.type === "cameras") {
+      $("cams").innerHTML = m.names.map((n, i) =>
+        `<div class="cam"><div>${n}</div><img id="img-${i}" alt="${n}"><div id="obs-${n}"></div></div>`).join("");
+    } else if (m.type === "obstacle") {
+      const el = $("obs-" + m.cam);
+      if (el) el.textContent = m.role === "land"
+        ? `ground ${m.ground_m} m | min ${m.min_m} m`
+        : `min ${m.min_m} m | L ${m.left_m} | C ${m.center_m} | R ${m.right_m}`;
+    } else if (m.type === "link" && !m.up) {
+      lastMsg = 0;
+    }
+  };
+}
+
+function drawMap() {
+  const c = $("map"), g = c.getContext("2d");
+  g.clearRect(0, 0, c.width, c.height);
+  const pts = route.map(p => ({ lat: p[0], lon: p[1] }));
+  if (pos) pts.push({ lat: pos.lat, lon: pos.lon });
+  if (!pts.length) return;
+  const lat0 = pts[0].lat, lon0 = pts[0].lon;
+  const k = Math.cos(lat0 * Math.PI / 180);
+  const xy = pts.map(p => [(p.lon - lon0) * 111320 * k, -(p.lat - lat0) * 110540]);
+  const xs = xy.map(p => p[0]), ys = xy.map(p => p[1]);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const span = Math.max(maxX - minX, maxY - minY, 10);
+  const s = (Math.min(c.width, c.height) - 40) / span;
+  const tx = p => 20 + (p[0] - minX) * s, ty = p => 20 + (p[1] - minY) * s;
+  const n = route.length;
+  g.strokeStyle = "#4af"; g.fillStyle = "#4af"; g.beginPath();
+  xy.slice(0, n).forEach((p, i) => { i ? g.lineTo(tx(p), ty(p)) : g.moveTo(tx(p), ty(p)); });
+  g.stroke();
+  xy.slice(0, n).forEach(p => { g.beginPath(); g.arc(tx(p), ty(p), 3, 0, 7); g.fill(); });
+  if (pos) {
+    const p = xy[xy.length - 1];
+    g.fillStyle = "#f84"; g.beginPath(); g.arc(tx(p), ty(p), 6, 0, 7); g.fill();
+  }
+}
+
+setInterval(() => {
+  const up = Date.now() - lastMsg < 3000;
+  $("status").textContent = up ? "live" : "offline";
+  $("status").className = up ? "up" : "";
+}, 1000);
+connect();
+</script>
+</body>
+</html>
