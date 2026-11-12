@@ -21,25 +21,34 @@
 <h1>Drone link <span id="status">offline</span></h1>
 <div class="grid">
   <div class="card" style="grid-column: 1 / -1"><div>Depth cameras</div><div id="cams" class="cams"></div></div>
+  <div class="card" style="grid-column: 1 / -1">
+    <div>3D view <select id="sel3d"><option value="">off</option></select>
+    <small>(drag to rotate, wheel to zoom; blue = near, red = far)</small></div>
+    <canvas id="c3d" width="800" height="450"></canvas>
+  </div>
   <div class="card"><div>Route</div><canvas id="map" width="400" height="300"></canvas></div>
   <div class="card"><div>Telemetry</div><pre id="tel"></pre></div>
 </div>
 <script>
 let route = [], pos = null, lastUrls = {}, lastMsg = 0;
+let camNames = [], meta3d = {}, want3d = "", wsRef = null, cloud = null;
 const $ = id => document.getElementById(id);
 
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws/view`);
   ws.binaryType = "arraybuffer";
+  wsRef = ws;
+  ws.onopen = sendView;
   ws.onclose = () => { setTimeout(connect, 2000); };
   ws.onmessage = ev => {
     lastMsg = Date.now();
     if (typeof ev.data !== "string") {
       const b = new Uint8Array(ev.data);
-      const img = $("img-" + b[0]);
+      const img = b[1] === 0 ? $("img-" + b[0]) : null;
+      if (b[1] === 1) { showCloud(camNames[b[0]], b.subarray(2)); return; }
       if (!img) return;
-      const url = URL.createObjectURL(new Blob([b.subarray(1)], { type: "image/jpeg" }));
+      const url = URL.createObjectURL(new Blob([b.subarray(2)], { type: "image/jpeg" }));
       img.src = url;
       if (lastUrls[b[0]]) URL.revokeObjectURL(lastUrls[b[0]]);
       lastUrls[b[0]] = url;
@@ -52,9 +61,14 @@ function connect() {
       drawMap();
     } else if (m.type === "route") {
       route = m.points; drawMap();
+    } else if (m.type === "depth3d") {
+      meta3d[m.cam] = m;
     } else if (m.type === "cameras") {
       $("cams").innerHTML = m.names.map((n, i) =>
         `<div class="cam"><div>${n}</div><img id="img-${i}" alt="${n}"><div id="obs-${n}"></div></div>`).join("");
+      camNames = m.names;
+      $("sel3d").innerHTML = `<option value="">off</option>` + m.names.map(n => `<option>${n}</option>`).join("");
+      $("sel3d").value = want3d;
     } else if (m.type === "obstacle") {
       const el = $("obs-" + m.cam);
       if (el) el.textContent = m.role === "land"
@@ -91,6 +105,78 @@ function drawMap() {
     g.fillStyle = "#f84"; g.beginPath(); g.arc(tx(p), ty(p), 6, 0, 7); g.fill();
   }
 }
+
+function sendView() {
+  if (wsRef && wsRef.readyState === 1) wsRef.send(JSON.stringify({ type: "view3d", cam: want3d || null }));
+}
+$("sel3d").onchange = e => { want3d = e.target.value; if (!want3d) cloud = null; sendView(); render(); };
+
+function heat(t) {
+  t = Math.min(Math.max(t, 0), 1);
+  const h = (1 - t) * 4, i = Math.min(Math.floor(h), 3), f = h - i;
+  const [r, g, b] = [[1, f, 0], [1 - f, 1, 0], [0, 1, f], [0, 1 - f, 1]][i];
+  return ((255 << 24) | ((b * 255 | 0) << 16) | ((g * 255 | 0) << 8) | (r * 255 | 0)) >>> 0;
+}
+
+async function showCloud(cam, png) {
+  const m = meta3d[cam];
+  if (!m) return;
+  const bmp = await createImageBitmap(new Blob([png], { type: "image/png" }), { colorSpaceConversion: "none" });
+  const oc = document.createElement("canvas");
+  oc.width = m.w; oc.height = m.h;
+  const og = oc.getContext("2d", { willReadFrequently: true });
+  og.drawImage(bmp, 0, 0);
+  const px = og.getImageData(0, 0, m.w, m.h).data;
+  const pts = new Float32Array(m.w * m.h * 3), col = new Uint32Array(m.w * m.h);
+  let n = 0;
+  for (let v = 0; v < m.h; v++) for (let u = 0; u < m.w; u++) {
+    const i = (v * m.w + u) * 4, d = ((px[i] << 8) | px[i + 1]) / 1000;
+    if (d < 0.1 || d > 8) continue;
+    pts[n * 3] = (u - m.cx) * d / m.fx;
+    pts[n * 3 + 1] = -(v - m.cy) * d / m.fy;
+    pts[n * 3 + 2] = d;
+    col[n++] = heat(d / 6);
+  }
+  cloud = { pts, col, n };
+  render();
+}
+
+const view = { yaw: 0.4, pitch: 0.25, dist: 5 };
+function render() {
+  const c = $("c3d"), g = c.getContext("2d"), W = c.width, H = c.height;
+  const img = g.createImageData(W, H), buf = new Uint32Array(img.data.buffer);
+  buf.fill(0xff111111);
+  if (cloud) {
+    const zb = new Float32Array(W * H).fill(1e9), f = H * 0.9;
+    const cyw = Math.cos(view.yaw), syw = Math.sin(view.yaw), cp = Math.cos(view.pitch), sp = Math.sin(view.pitch);
+    for (let k = 0; k < cloud.n; k++) {
+      const x0 = cloud.pts[k * 3], y0 = cloud.pts[k * 3 + 1], z0 = cloud.pts[k * 3 + 2] - 2;
+      const x1 = cyw * x0 + syw * z0, z1 = -syw * x0 + cyw * z0;
+      const y2 = cp * y0 - sp * z1, z2 = sp * y0 + cp * z1, zz = z2 + view.dist;
+      if (zz < 0.1) continue;
+      const sx = (W / 2 + f * x1 / zz) | 0, sy = (H / 2 - f * y2 / zz) | 0;
+      for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++) {
+        const X = sx + dx, Y = sy + dy;
+        if (X < 0 || Y < 0 || X >= W || Y >= H) continue;
+        const j = Y * W + X;
+        if (zz < zb[j]) { zb[j] = zz; buf[j] = cloud.col[k]; }
+      }
+    }
+  }
+  g.putImageData(img, 0, 0);
+}
+let drag = null;
+$("c3d").onmousedown = e => { drag = [e.clientX, e.clientY]; };
+window.onmouseup = () => { drag = null; };
+window.onmousemove = e => {
+  if (!drag) return;
+  view.yaw += (e.clientX - drag[0]) * 0.01;
+  view.pitch += (e.clientY - drag[1]) * 0.01;
+  drag = [e.clientX, e.clientY];
+  render();
+};
+$("c3d").onwheel = e => { e.preventDefault(); view.dist = Math.max(1, view.dist * (e.deltaY > 0 ? 1.1 : 0.9)); render(); };
+render();
 
 setInterval(() => {
   const up = Date.now() - lastMsg < 3000;

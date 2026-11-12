@@ -15,7 +15,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 app = FastAPI()
 viewers: set[WebSocket] = set()
 last_json: dict[str, str] = {}      # latest message of each type, replayed to new viewers
-last_frames: dict[int, bytes] = {}  # latest JPEG per camera (first byte = camera index)
+drone_conn: WebSocket | None = None
+want3d = json.dumps({"type": "view3d", "cam": None})
+last_frames: dict[tuple[int, int], bytes] = {}  # latest JPEG per camera (first byte = camera index)
 
 
 @app.get("/")
@@ -39,6 +41,7 @@ async def broadcast(msg):
 
 @app.websocket("/ws/drone")
 async def drone_ws(ws: WebSocket, token: str = ""):
+    global drone_conn
     if token != TOKEN:
         await ws.close(code=1008)
         return
@@ -46,6 +49,8 @@ async def drone_ws(ws: WebSocket, token: str = ""):
     last_json.clear()
     last_frames.clear()
     print("drone connected")
+    drone_conn = ws
+    await ws.send_text(want3d)
     try:
         while True:
             m = await ws.receive()
@@ -53,7 +58,7 @@ async def drone_ws(ws: WebSocket, token: str = ""):
                 break
             if m.get("bytes") is not None:
                 b = m["bytes"]
-                last_frames[b[0]] = b
+                last_frames[(b[0], b[1])] = b
                 await broadcast(b)
             elif m.get("text") is not None:
                 text = m["text"]
@@ -67,11 +72,14 @@ async def drone_ws(ws: WebSocket, token: str = ""):
         pass
     finally:
         print("drone disconnected")
+        if drone_conn is ws:
+            drone_conn = None
         await broadcast(json.dumps({"type": "link", "up": False}))
 
 
 @app.websocket("/ws/view")
 async def view_ws(ws: WebSocket):
+    global want3d
     await ws.accept()
     for t in last_json.values():
         await ws.send_text(t)
@@ -80,7 +88,18 @@ async def view_ws(ws: WebSocket):
     viewers.add(ws)
     try:
         while True:
-            await ws.receive_text()   # keep the socket open
+            text = await ws.receive_text()
+            try:
+                msg = json.loads(text)
+            except ValueError:
+                continue
+            if msg.get("type") == "view3d":     # forward the viewer's 3D camera choice to the drone
+                want3d = text
+                if drone_conn:
+                    try:
+                        await drone_conn.send_text(text)
+                    except Exception:
+                        pass
     except WebSocketDisconnect:
         pass
     finally:

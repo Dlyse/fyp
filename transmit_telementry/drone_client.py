@@ -51,6 +51,9 @@ RS_W, RS_H, RS_FPS = 424, 240, 15   # depth only: keeps 5 cameras inside USB ban
 FAKE_DEPTH = os.environ.get("FAKE_DEPTH") == "1"
 
 latest: dict = {}   # camera name -> newest uint16 depth image in mm
+INTR: dict = {}     # camera name -> (fx, fy, cx, cy) at native resolution
+view3d = None       # camera the website wants as a 3D point cloud (None = off)
+DEPTH3D_HZ = 2
 ACTIVE: list = []   # (name, role) of cameras actually started; only these are sent
 
 
@@ -64,6 +67,8 @@ def realsense_reader(name, serial):
             cfg.enable_stream(rs.stream.depth, RS_W, RS_H, rs.format.z16, RS_FPS)
             prof = pipe.start(cfg)
             scale = prof.get_device().first_depth_sensor().get_depth_scale()
+            k = prof.get_stream(rs.stream.depth).as_video_stream_profile().get_intrinsics()
+            INTR[name] = (k.fx, k.fy, k.ppx, k.ppy)
             print(f"{name}: started ({serial})")
             while True:
                 fs = pipe.wait_for_frames(5000)
@@ -83,6 +88,8 @@ def realsense_reader(name, serial):
 
 def fake_reader(name, i):
     h, w = RS_H, RS_W
+    f = (w / 2) / math.tan(math.radians(43.5))
+    INTR[name] = (f, f, w / 2, h / 2)
     y, x = np.mgrid[0:h, 0:w]
     while True:
         d = 2000 + 1500 * np.sin(x / 40.0 + i) + 800 * np.cos(y / 30.0 + time.time())
@@ -109,6 +116,23 @@ def start_cameras():
         ACTIVE.append((name, role))
         threading.Thread(target=realsense_reader, args=(name, serial), daemon=True).start()
         time.sleep(1)   # stagger USB start-up
+
+
+def encode_depth3d(name, depth_mm):
+    """Lossless half-resolution depth as a PNG (R = high byte, G = low byte) plus intrinsics."""
+    h, w = depth_mm.shape
+    tw, th = w // 2, h // 2
+    small = cv2.resize(depth_mm, (tw, th), interpolation=cv2.INTER_NEAREST)
+    img = np.zeros((th, tw, 3), np.uint8)
+    img[:, :, 2] = small >> 8
+    img[:, :, 1] = small & 255
+    ok, png = cv2.imencode(".png", img, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+    f = (w / 2) / math.tan(math.radians(43.5))
+    fx, fy, cx, cy = INTR.get(name, (f, f, w / 2, h / 2))
+    s = tw / w
+    meta = {"type": "depth3d", "cam": name, "w": tw, "h": th,
+            "fx": fx * s, "fy": fy * s, "cx": cx * s, "cy": cy * s}
+    return meta, (png.tobytes() if ok else None)
 
 
 def _near(a: np.ndarray):
@@ -195,6 +219,7 @@ async def send_state(ws):
 async def send_depth(ws):
     await ws.send(json.dumps({"type": "cameras", "names": [c[0] for c in ACTIVE]}))
     last_img = {}
+    last3d = 0.0
     while True:
         t0 = time.time()
         jobs = []
@@ -211,8 +236,28 @@ async def send_depth(ws):
         for idx, summary, jpg in results:
             await ws.send(json.dumps(summary))
             if jpg:
-                await ws.send(bytes([idx]) + jpg)   # first byte = camera index
+                await ws.send(bytes([idx, 0]) + jpg)   # header: camera index, kind 0 = preview JPEG
+        names = [c[0] for c in ACTIVE]
+        if view3d in names and view3d in latest and t0 - last3d >= 1 / DEPTH3D_HZ:
+            last3d = t0
+            meta, png = await asyncio.to_thread(encode_depth3d, view3d, latest[view3d])
+            if png:
+                await ws.send(json.dumps(meta))
+                await ws.send(bytes([names.index(view3d), 1]) + png)   # kind 1 = depth PNG
         await asyncio.sleep(max(0, 1 / OBS_HZ - (time.time() - t0)))
+
+
+async def recv_loop(ws):
+    global view3d
+    async for msg in ws:
+        if isinstance(msg, str):
+            try:
+                m = json.loads(msg)
+            except ValueError:
+                continue
+            if m.get("type") == "view3d":
+                view3d = m.get("cam")
+                print("3D view:", view3d)
 
 
 async def run_link():
@@ -223,7 +268,8 @@ async def run_link():
                                           ping_interval=10, ping_timeout=10) as ws:
                 print("link up")
                 backoff = 1
-                tasks = [asyncio.create_task(send_state(ws)), asyncio.create_task(send_depth(ws))]
+                tasks = [asyncio.create_task(send_state(ws)), asyncio.create_task(send_depth(ws)),
+                         asyncio.create_task(recv_loop(ws))]
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
                 for p in pending:
                     p.cancel()
