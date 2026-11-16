@@ -29,9 +29,15 @@ SERVER_URL = os.environ.get("SERVER_URL", "ws://192.168.1.50:8000/ws/drone")
 TOKEN = os.environ.get("DRONE_TOKEN", "change-me")
 MAV_ADDR = os.environ.get("MAV_ADDR", "udpin://0.0.0.0:14540")
 
-TELEMETRY_HZ = 2
-OBS_HZ = 5                # obstacle summary rate, per camera
-IMG_HZ = 2                # depth image rate, per camera (keeps cellular use low)
+def _hz(name, default):
+    return float(os.environ.get(name, default))
+
+
+# Update rates, all adjustable from the command line, e.g.  DEPTH3D_ALL_HZ=2 IMG_HZ=2 python ...
+# Defaults suit WiFi / simulation. For a cellular link use something like 1-2 for the image rates.
+TELEMETRY_HZ = _hz("TELEMETRY_HZ", 5)
+OBS_HZ = _hz("OBS_HZ", 10)      # obstacle summary rate, per camera
+IMG_HZ = _hz("IMG_HZ", 5)       # greyscale depth preview rate, per camera
 DEPTH_MAX_MM = 6000        # colour-map range
 IMG_SIZE = (320, 180)      # width, height sent to the website
 JPEG_QUALITY = 60
@@ -56,8 +62,8 @@ USE_COLOR = os.environ.get("USE_COLOR", "1") == "1"   # RGB for the 3D view; 0 =
 latest: dict = {}   # camera name -> newest uint16 depth image in mm
 INTR: dict = {}     # camera name -> (fx, fy, cx, cy) at native resolution
 view3d = None       # camera the website wants as a 3D point cloud (None = off)
-DEPTH3D_HZ = 2          # one camera chosen in 3D view
-DEPTH3D_ALL_HZ = 1      # per camera when the page asks for "all"
+DEPTH3D_HZ = _hz("DEPTH3D_HZ", 8)          # one camera chosen in 3D view
+DEPTH3D_ALL_HZ = _hz("DEPTH3D_ALL_HZ", 5)  # per camera when the page asks for "all"
 latest_color: dict = {}  # camera name -> (timestamp, BGR image aligned to the depth image)
 ACTIVE: list = []   # (name, role) of cameras actually started; only these are sent
 
@@ -343,26 +349,30 @@ async def send_state(ws):
 
 async def send_depth(ws):
     await ws.send(json.dumps({"type": "cameras", "names": [c[0] for c in ACTIVE]}))
-    last_img = {}
-    last3d = {}
+    last_obs, last_img, last3d = {}, {}, {}
     while True:
         t0 = time.time()
+        names = [c[0] for c in ACTIVE]
         jobs = []
         for idx, (name, role) in enumerate(ACTIVE):
             frame = latest.get(name)
             if frame is None:
                 continue
-            want = t0 - last_img.get(name, 0) >= 1 / IMG_HZ
-            if want:
-                last_img[name] = t0
-            jobs.append((idx, name, role, frame, want))
-        results = await asyncio.to_thread(
-            lambda: [(idx, *process_depth(n, r, f, w)) for idx, n, r, f, w in jobs])
-        for idx, summary, jpg in results:
-            await ws.send(json.dumps(summary))
-            if jpg:
-                await ws.send(bytes([idx, 0]) + jpg)   # header: camera index, kind 0 = preview JPEG
-        names = [c[0] for c in ACTIVE]
+            want_obs = t0 - last_obs.get(name, 0) >= 1 / OBS_HZ
+            want_img = t0 - last_img.get(name, 0) >= 1 / IMG_HZ
+            if want_obs or want_img:       # each camera has its own timers
+                if want_obs:
+                    last_obs[name] = t0
+                if want_img:
+                    last_img[name] = t0
+                jobs.append((idx, name, role, frame, want_img))
+        if jobs:
+            results = await asyncio.to_thread(
+                lambda: [(idx, *process_depth(n, r, f, w)) for idx, n, r, f, w in jobs])
+            for idx, summary, jpg in results:
+                await ws.send(json.dumps(summary))
+                if jpg:
+                    await ws.send(bytes([idx, 0]) + jpg)   # header: camera index, kind 0 = preview JPEG
         rate = DEPTH3D_ALL_HZ if view3d == "all" else DEPTH3D_HZ
         for n in [n for n in names if wants3d(n) and n in latest]:
             if t0 - last3d.get(n, 0) < 1 / rate:
@@ -372,7 +382,7 @@ async def send_depth(ws):
             if payload:
                 await ws.send(json.dumps(meta))
                 await ws.send(bytes([names.index(n), 1]) + payload)   # kind 1 = depth + colour
-        await asyncio.sleep(max(0, 1 / OBS_HZ - (time.time() - t0)))
+        await asyncio.sleep(max(0, 1 / 20 - (time.time() - t0)))      # loop ticks at 20 Hz
 
 
 async def recv_loop(ws):

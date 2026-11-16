@@ -141,7 +141,7 @@ async function showCloud(cam, bytes) {
     col[n++] = ((255 << 24) | ((b | 0) << 16) | ((g | 0) << 8) | (r | 0)) >>> 0;
   }
   clouds[cam] = { pts, col, n, t: Date.now() };
-  render();
+  scheduleRender();
 }
 
 const CAM_YAW = { front: 0, right: 90, back: 180, left: 270 };   // mounting direction, degrees clockwise from above
@@ -177,6 +177,12 @@ function render() {
   g.putImageData(img, 0, 0);
   if (merged) { g.fillStyle = "#fff"; g.fillRect(W / 2 - 3, H / 2 - 3, 6, 6); }   // the drone
 }
+let renderPending = false;
+function scheduleRender() {          // draw at most once per screen refresh, however many clouds arrive
+  if (renderPending) return;
+  renderPending = true;
+  requestAnimationFrame(() => { renderPending = false; render(); });
+}
 let drag = null;
 $("c3d").onmousedown = e => { drag = [e.clientX, e.clientY]; };
 window.onmouseup = () => { drag = null; };
@@ -185,9 +191,9 @@ window.onmousemove = e => {
   view.yaw += (e.clientX - drag[0]) * 0.01;
   view.pitch += (e.clientY - drag[1]) * 0.01;
   drag = [e.clientX, e.clientY];
-  render();
+  scheduleRender();
 };
-$("c3d").onwheel = e => { e.preventDefault(); view.dist = Math.max(1, view.dist * (e.deltaY > 0 ? 1.1 : 0.9)); render(); };
+$("c3d").onwheel = e => { e.preventDefault(); view.dist = Math.max(1, view.dist * (e.deltaY > 0 ? 1.1 : 0.9)); scheduleRender(); };
 render();
 
 setInterval(() => {
