@@ -106,3 +106,10 @@ async def view_ws(ws: WebSocket):
         pass
     finally:
         viewers.discard(ws)
+        if not viewers:       # last page closed: tell the drone to stop sending 3D data
+            want3d = json.dumps({"type": "view3d", "cam": None})
+            if drone_conn:
+                try:
+                    await drone_conn.send_text(want3d)
+                except Exception:
+                    pass

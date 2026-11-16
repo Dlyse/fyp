@@ -10,6 +10,7 @@ Env vars:
   SERVER_URL  ws://<server-ip>:8000/ws/drone   (use wss:// once you have TLS)
   DRONE_TOKEN same secret as the server
   MAV_ADDR    udpin://0.0.0.0:14540  (PX4 SITL / mavlink-router)  or  serial:///dev/ttyTHS1:921600
+  ROS2=1      take depth/colour from ROS 2 topics (Gazebo) instead of RealSense; edit ROS_TOPICS
 """
 import asyncio
 import json
@@ -55,9 +56,17 @@ USE_COLOR = os.environ.get("USE_COLOR", "1") == "1"   # RGB for the 3D view; 0 =
 latest: dict = {}   # camera name -> newest uint16 depth image in mm
 INTR: dict = {}     # camera name -> (fx, fy, cx, cy) at native resolution
 view3d = None       # camera the website wants as a 3D point cloud (None = off)
-DEPTH3D_HZ = 2
+DEPTH3D_HZ = 2          # one camera chosen in 3D view
+DEPTH3D_ALL_HZ = 1      # per camera when the page asks for "all"
 latest_color: dict = {}  # camera name -> (timestamp, BGR image aligned to the depth image)
 ACTIVE: list = []   # (name, role) of cameras actually started; only these are sent
+
+
+def wants3d(name):
+    """True if the website currently wants this camera in 3D ("all" = every avoidance camera)."""
+    if view3d == name:
+        return True
+    return view3d == "all" and any(n == name and r == "avoid" for n, r in ACTIVE)
 
 
 def realsense_reader(name, serial):
@@ -86,7 +95,7 @@ def realsense_reader(name, serial):
             print(f"{name}: started ({serial}), colour={'on' if use_color else 'off'}")
             while True:
                 fs = pipe.wait_for_frames(5000)
-                if use_color and view3d == name:      # only align the camera being viewed in 3D
+                if use_color and wants3d(name):       # only align cameras being viewed in 3D
                     fs = align.process(fs)
                     c = fs.get_color_frame()
                     if c:
@@ -114,7 +123,7 @@ def fake_reader(name, i):
     while True:
         d = 2000 + 1500 * np.sin(x / 40.0 + i) + 800 * np.cos(y / 30.0 + time.time())
         latest[name] = d.astype(np.uint16)
-        if view3d == name:   # fake colour image so the 3D colours can be tested
+        if wants3d(name):   # fake colour image so the 3D colours can be tested
             c = np.zeros((h, w, 3), np.uint8)
             c[:, :, 0] = (x * 255 // w).astype(np.uint8)
             c[:, :, 1] = (y * 255 // h).astype(np.uint8)
@@ -123,7 +132,86 @@ def fake_reader(name, i):
         time.sleep(1 / RS_FPS)
 
 
+# ------------------------------------------------------- ROS 2 / Gazebo camera input
+# Edit to match `ros2 topic list`:  name: (depth image, camera info, colour image or None)
+# Depth may be 16UC1 (mm) or 32FC1 (m). Colour should be the same size/pose as depth (as an
+# RGBD sensor gives) so the colours line up with the points.
+ROS_TOPICS = {
+    "front": ("/cam_front/depth_image", "/cam_front/camera_info", "/cam_front/image"),
+    "right": ("/cam_right/depth_image", "/cam_right/camera_info", "/cam_right/image"),
+    "back": ("/cam_back/depth_image", "/cam_back/camera_info", "/cam_back/image"),
+    "left": ("/cam_left/depth_image", "/cam_left/camera_info", "/cam_left/image"),
+    # the sim has no downward (landing) camera, so there is no "down" entry
+}
+
+
+def _img(msg, dtype, ch=1):
+    """sensor_msgs/Image -> numpy array (no cv_bridge needed), honouring row padding."""
+    a = np.frombuffer(msg.data, dtype)
+    per_row = msg.step // np.dtype(dtype).itemsize
+    a = a.reshape(msg.height, per_row)[:, : msg.width * ch]
+    return a.reshape(msg.height, msg.width, ch) if ch > 1 else a
+
+
+def ros_depth_to_mm(msg):
+    if msg.encoding in ("16UC1", "mono16"):
+        return _img(msg, np.uint16).copy()
+    if msg.encoding == "32FC1":
+        a = np.nan_to_num(_img(msg, np.float32), nan=0.0, posinf=0.0, neginf=0.0) * 1000
+        return np.clip(a, 0, 65535).astype(np.uint16)
+    return None
+
+
+def ros_color_to_bgr(msg):
+    if msg.encoding in ("rgb8", "bgr8"):
+        a = _img(msg, np.uint8, 3)
+        return (a[:, :, ::-1] if msg.encoding == "rgb8" else a).copy()
+    if msg.encoding in ("rgba8", "bgra8"):
+        a = _img(msg, np.uint8, 4)[:, :, :3]
+        return (a[:, :, ::-1] if msg.encoding == "rgba8" else a).copy()
+    return None
+
+
+def start_ros2():
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.qos import qos_profile_sensor_data
+    from sensor_msgs.msg import CameraInfo, Image
+
+    rclpy.init()
+    node = Node("drone_link")
+    roles = {c[0]: c[1] for c in CAMERAS}
+    for name, (depth_t, info_t, color_t) in ROS_TOPICS.items():
+        ACTIVE.append((name, roles.get(name, "avoid")))
+
+        def on_depth(msg, name=name):
+            d = ros_depth_to_mm(msg)
+            if d is None:
+                print(f"{name}: unsupported depth encoding {msg.encoding}")
+            else:
+                latest[name] = d
+
+        def on_info(msg, name=name):
+            INTR[name] = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])
+
+        def on_color(msg, name=name):
+            if wants3d(name):   # only convert colour for cameras being viewed in 3D
+                c = ros_color_to_bgr(msg)
+                if c is not None:
+                    latest_color[name] = (time.time(), c)
+
+        node.create_subscription(Image, depth_t, on_depth, qos_profile_sensor_data)
+        node.create_subscription(CameraInfo, info_t, on_info, qos_profile_sensor_data)
+        if color_t:
+            node.create_subscription(Image, color_t, on_color, qos_profile_sensor_data)
+        print(f"{name}: ROS 2 topics {depth_t}, {info_t}, {color_t}")
+    threading.Thread(target=rclpy.spin, args=(node,), daemon=True).start()
+
+
 def start_cameras():
+    if os.environ.get("ROS2") == "1":
+        start_ros2()
+        return
     if FAKE_DEPTH:
         for i, (name, role, _) in enumerate(CAMERAS):
             ACTIVE.append((name, role))
@@ -256,7 +344,7 @@ async def send_state(ws):
 async def send_depth(ws):
     await ws.send(json.dumps({"type": "cameras", "names": [c[0] for c in ACTIVE]}))
     last_img = {}
-    last3d = 0.0
+    last3d = {}
     while True:
         t0 = time.time()
         jobs = []
@@ -275,12 +363,15 @@ async def send_depth(ws):
             if jpg:
                 await ws.send(bytes([idx, 0]) + jpg)   # header: camera index, kind 0 = preview JPEG
         names = [c[0] for c in ACTIVE]
-        if view3d in names and view3d in latest and t0 - last3d >= 1 / DEPTH3D_HZ:
-            last3d = t0
-            meta, png = await asyncio.to_thread(encode_depth3d, view3d, latest[view3d])
-            if png:
+        rate = DEPTH3D_ALL_HZ if view3d == "all" else DEPTH3D_HZ
+        for n in [n for n in names if wants3d(n) and n in latest]:
+            if t0 - last3d.get(n, 0) < 1 / rate:
+                continue
+            last3d[n] = t0
+            meta, payload = await asyncio.to_thread(encode_depth3d, n, latest[n])
+            if payload:
                 await ws.send(json.dumps(meta))
-                await ws.send(bytes([names.index(view3d), 1]) + png)   # kind 1 = depth PNG
+                await ws.send(bytes([names.index(n), 1]) + payload)   # kind 1 = depth + colour
         await asyncio.sleep(max(0, 1 / OBS_HZ - (time.time() - t0)))
 
 
