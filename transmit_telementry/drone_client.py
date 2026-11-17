@@ -62,6 +62,27 @@ USE_COLOR = os.environ.get("USE_COLOR", "1") == "1"   # RGB for the 3D view; 0 =
 latest: dict = {}   # camera name -> newest uint16 depth image in mm
 INTR: dict = {}     # camera name -> (fx, fy, cx, cy) at native resolution
 view3d = None       # camera the website wants as a 3D point cloud (None = off)
+rgb_cam = None      # camera the website wants as live RGB video: a name, "all", or None = off
+RGB_FPS = _hz("RGB_FPS", 30)                    # frame-rate cap per camera for the RGB video
+RGB_QUALITY = int(_hz("RGB_QUALITY", 70))       # JPEG quality of the RGB video feed
+latest_rgb: dict = {}                           # camera name -> newest BGR frame
+rgb_seq: dict = {}                              # camera name -> frame counter
+LOOP = None                                     # asyncio loop and event, set in main()
+rgb_event = None
+
+
+def wantsrgb(name):
+    return rgb_cam == name or rgb_cam == "all"
+
+
+def push_rgb(name, bgr):
+    """Called from camera threads: keep only the newest RGB frame and wake the sender."""
+    latest_rgb[name] = bgr
+    rgb_seq[name] = rgb_seq.get(name, 0) + 1
+    if LOOP is not None and rgb_event is not None:
+        LOOP.call_soon_threadsafe(rgb_event.set)
+
+
 DEPTH3D_HZ = _hz("DEPTH3D_HZ", 8)          # one camera chosen in 3D view
 DEPTH3D_ALL_HZ = _hz("DEPTH3D_ALL_HZ", 5)  # per camera when the page asks for "all"
 latest_color: dict = {}  # camera name -> (timestamp, BGR image aligned to the depth image)
@@ -101,6 +122,10 @@ def realsense_reader(name, serial):
             print(f"{name}: started ({serial}), colour={'on' if use_color else 'off'}")
             while True:
                 fs = pipe.wait_for_frames(5000)
+                if use_color and wantsrgb(name):
+                    cf = fs.get_color_frame()
+                    if cf:
+                        push_rgb(name, np.asanyarray(cf.get_data()).copy())
                 if use_color and wants3d(name):       # only align cameras being viewed in 3D
                     fs = align.process(fs)
                     c = fs.get_color_frame()
@@ -129,12 +154,15 @@ def fake_reader(name, i):
     while True:
         d = 2000 + 1500 * np.sin(x / 40.0 + i) + 800 * np.cos(y / 30.0 + time.time())
         latest[name] = d.astype(np.uint16)
-        if wants3d(name):   # fake colour image so the 3D colours can be tested
+        if wants3d(name) or wantsrgb(name):   # fake colour image for testing
             c = np.zeros((h, w, 3), np.uint8)
             c[:, :, 0] = (x * 255 // w).astype(np.uint8)
             c[:, :, 1] = (y * 255 // h).astype(np.uint8)
             c[:, :, 2] = 160
-            latest_color[name] = (time.time(), c)
+            if wants3d(name):
+                latest_color[name] = (time.time(), c)
+            if wantsrgb(name):
+                push_rgb(name, c)
         time.sleep(1 / RS_FPS)
 
 
@@ -201,10 +229,16 @@ def start_ros2():
             INTR[name] = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])
 
         def on_color(msg, name=name):
-            if wants3d(name):   # only convert colour for cameras being viewed in 3D
-                c = ros_color_to_bgr(msg)
-                if c is not None:
-                    latest_color[name] = (time.time(), c)
+            want3, wantrgb = wants3d(name), wantsrgb(name)
+            if not (want3 or wantrgb):
+                return                      # nobody is looking: skip the conversion
+            c = ros_color_to_bgr(msg)
+            if c is None:
+                return
+            if want3:
+                latest_color[name] = (time.time(), c)
+            if wantrgb:
+                push_rgb(name, c)
 
         node.create_subscription(Image, depth_t, on_depth, qos_profile_sensor_data)
         node.create_subscription(CameraInfo, info_t, on_info, qos_profile_sensor_data)
@@ -382,11 +416,37 @@ async def send_depth(ws):
             if payload:
                 await ws.send(json.dumps(meta))
                 await ws.send(bytes([names.index(n), 1]) + payload)   # kind 1 = depth + colour
-        await asyncio.sleep(max(0, 1 / 20 - (time.time() - t0)))      # loop ticks at 20 Hz
+        await asyncio.sleep(max(0, 1 / 60 - (time.time() - t0)))      # loop ticks at 60 Hz
+
+
+async def send_rgb(ws):
+    """Live RGB video: frame-driven, newest frame per camera only, JPEG at native resolution."""
+    last_t, sent = {}, {}
+    while True:
+        await rgb_event.wait()
+        rgb_event.clear()
+        now = time.time()
+        due = []
+        for idx, (name, _) in enumerate(ACTIVE):
+            frame, seq = latest_rgb.get(name), rgb_seq.get(name, 0)
+            if not wantsrgb(name) or frame is None or seq == sent.get(name):
+                continue
+            if now - last_t.get(name, 0) < 0.9 / RGB_FPS:      # per-camera frame-rate cap
+                continue
+            last_t[name], sent[name] = now, seq
+            due.append((idx, frame))
+        if not due:
+            continue
+        results = await asyncio.gather(*[
+            asyncio.to_thread(cv2.imencode, ".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, RGB_QUALITY])
+            for _, f in due])
+        for (idx, _), (ok, jpg) in zip(due, results):
+            if ok:
+                await ws.send(bytes([idx, 2]) + jpg.tobytes())   # kind 2 = RGB video
 
 
 async def recv_loop(ws):
-    global view3d
+    global view3d, rgb_cam
     async for msg in ws:
         if isinstance(msg, str):
             try:
@@ -396,6 +456,9 @@ async def recv_loop(ws):
             if m.get("type") == "view3d":
                 view3d = m.get("cam")
                 print("3D view:", view3d)
+            elif m.get("type") == "rgb":
+                rgb_cam = m.get("cam")
+                print("RGB view:", rgb_cam)
 
 
 async def run_link():
@@ -407,7 +470,7 @@ async def run_link():
                 print("link up")
                 backoff = 1
                 tasks = [asyncio.create_task(send_state(ws)), asyncio.create_task(send_depth(ws)),
-                         asyncio.create_task(recv_loop(ws))]
+                         asyncio.create_task(recv_loop(ws)), asyncio.create_task(send_rgb(ws))]
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
                 for p in pending:
                     p.cancel()
@@ -448,6 +511,9 @@ async def px4_task():
 
 
 async def main():
+    global LOOP, rgb_event
+    LOOP = asyncio.get_running_loop()
+    rgb_event = asyncio.Event()
     await asyncio.to_thread(start_cameras)
     if os.environ.get("NO_PX4") == "1":
         asyncio.create_task(fake_px4())

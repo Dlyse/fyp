@@ -18,7 +18,13 @@ app = FastAPI()
 viewers: set[WebSocket] = set()
 last_json: dict[str, str] = {}      # latest message of each type, replayed to new viewers
 drone_conn: WebSocket | None = None
-want3d = json.dumps({"type": "view3d", "cam": None})
+
+
+def _off(kind):
+    return json.dumps({"type": kind, "cam": None})
+
+
+wants: dict[str, str] = {"view3d": _off("view3d"), "rgb": _off("rgb")}   # latest choice per kind
 last_frames: dict[tuple[int, int], bytes] = {}  # latest JPEG per camera (first byte = camera index)
 
 
@@ -52,7 +58,8 @@ async def drone_ws(ws: WebSocket, token: str = ""):
     last_frames.clear()
     print("drone connected")
     drone_conn = ws
-    await ws.send_text(want3d)
+    for text in wants.values():     # tell the drone what the page is currently showing
+        await ws.send_text(text)
     try:
         while True:
             m = await ws.receive()
@@ -81,7 +88,6 @@ async def drone_ws(ws: WebSocket, token: str = ""):
 
 @app.websocket("/ws/view")
 async def view_ws(ws: WebSocket):
-    global want3d
     await ws.accept()
     for t in last_json.values():
         await ws.send_text(t)
@@ -95,8 +101,8 @@ async def view_ws(ws: WebSocket):
                 msg = json.loads(text)
             except ValueError:
                 continue
-            if msg.get("type") == "view3d":     # forward the viewer's 3D camera choice to the drone
-                want3d = text
+            if msg.get("type") in wants:        # forward 3D / RGB camera choices to the drone
+                wants[msg["type"]] = text
                 if drone_conn:
                     try:
                         await drone_conn.send_text(text)
@@ -106,10 +112,11 @@ async def view_ws(ws: WebSocket):
         pass
     finally:
         viewers.discard(ws)
-        if not viewers:       # last page closed: tell the drone to stop sending 3D data
-            want3d = json.dumps({"type": "view3d", "cam": None})
-            if drone_conn:
-                try:
-                    await drone_conn.send_text(want3d)
-                except Exception:
-                    pass
+        if not viewers:       # last page closed: tell the drone to stop sending 3D / video data
+            for kind in wants:
+                wants[kind] = _off(kind)
+                if drone_conn:
+                    try:
+                        await drone_conn.send_text(wants[kind])
+                    except Exception:
+                        pass

@@ -14,6 +14,8 @@
   img, canvas { width: 100%; background: #000; border-radius: 4px; image-rendering: pixelated; }
   .cams { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; }
   .cam div { font-size: 12px; }
+  .cam canvas, .cam img { margin-bottom: 4px; }
+  canvas.rgb { image-rendering: auto; }
   pre { margin: 0; font-size: 13px; white-space: pre-wrap; }
 </style>
 </head>
@@ -31,7 +33,7 @@
 </div>
 <script>
 let route = [], pos = null, lastUrls = {}, lastMsg = 0;
-let camNames = [], meta3d = {}, want3d = "all", wsRef = null, clouds = {};
+let camNames = [], meta3d = {}, want3d = "all", wantRgb = "all", wsRef = null, clouds = {};
 const $ = id => document.getElementById(id);
 
 function connect() {
@@ -47,6 +49,7 @@ function connect() {
       const b = new Uint8Array(ev.data);
       const img = b[1] === 0 ? $("img-" + b[0]) : null;
       if (b[1] === 1) { showCloud(camNames[b[0]], b.subarray(2)); return; }
+      if (b[1] === 2) { showRgb(b[0], b.subarray(2)); return; }
       if (!img) return;
       const url = URL.createObjectURL(new Blob([b.subarray(2)], { type: "image/jpeg" }));
       img.src = url;
@@ -65,10 +68,11 @@ function connect() {
       meta3d[m.cam] = m;
     } else if (m.type === "cameras") {
       $("cams").innerHTML = m.names.map((n, i) =>
-        `<div class="cam"><div>${n}</div><img id="img-${i}" alt="${n}"><div id="obs-${n}"></div></div>`).join("");
+        `<div class="cam"><div>${n} <small id="fps-${i}"></small></div><canvas class="rgb" id="rgb-${i}" width="640" height="480"></canvas><img id="img-${i}" alt="${n}"><div id="obs-${n}"></div></div>`).join("");
       camNames = m.names;
       $("sel3d").innerHTML = `<option value="">off</option><option value="all">all cameras</option>` + m.names.map(n => `<option>${n}</option>`).join("");
       $("sel3d").value = want3d;
+      sendView();
     } else if (m.type === "obstacle") {
       const el = $("obs-" + m.cam);
       if (el) el.textContent = m.role === "land"
@@ -107,7 +111,9 @@ function drawMap() {
 }
 
 function sendView() {
-  if (wsRef && wsRef.readyState === 1) wsRef.send(JSON.stringify({ type: "view3d", cam: want3d || null }));
+  if (!wsRef || wsRef.readyState !== 1) return;
+  wsRef.send(JSON.stringify({ type: "view3d", cam: want3d || null }));
+  wsRef.send(JSON.stringify({ type: "rgb", cam: wantRgb || null }));
 }
 $("sel3d").onchange = e => { want3d = e.target.value; clouds = {}; view.dist = want3d === "all" ? 9 : 5; sendView(); render(); };
 
@@ -195,6 +201,35 @@ window.onmousemove = e => {
 };
 $("c3d").onwheel = e => { e.preventDefault(); view.dist = Math.max(1, view.dist * (e.deltaY > 0 ? 1.1 : 0.9)); scheduleRender(); };
 render();
+
+const rgbState = {};   // per camera: decoding flag, newest waiting frame, frame counter
+async function showRgb(idx, bytes) {
+  const s = rgbState[idx] || (rgbState[idx] = { busy: false, next: null, count: 0 });
+  if (s.busy) { s.next = bytes; return; }   // still decoding: keep only the newest waiting frame
+  s.busy = true;
+  try {
+    let cur = bytes;
+    while (cur) {
+      s.next = null;
+      const bmp = await createImageBitmap(new Blob([cur], { type: "image/jpeg" }));
+      const c = $("rgb-" + idx);
+      if (c) {
+        if (c.width !== bmp.width || c.height !== bmp.height) { c.width = bmp.width; c.height = bmp.height; }
+        c.getContext("2d").drawImage(bmp, 0, 0);
+      }
+      bmp.close();
+      s.count++;
+      cur = s.next;
+    }
+  } catch (e) { /* skip a bad frame */ } finally { s.busy = false; }
+}
+setInterval(() => {
+  for (const [i, s] of Object.entries(rgbState)) {
+    const el = $("fps-" + i);
+    if (el) el.textContent = s.count + " fps";
+    s.count = 0;
+  }
+}, 1000);
 
 setInterval(() => {
   const up = Date.now() - lastMsg < 3000;
