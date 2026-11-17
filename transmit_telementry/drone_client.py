@@ -43,7 +43,8 @@ IMG_SIZE = (320, 180)      # width, height sent to the website
 JPEG_QUALITY = 60
 
 state: dict = {}           # latest telemetry, filled by the watcher tasks
-route: list = []           # [[lat, lon, alt], ...]
+route: list = []           # [[lat, lon, alt], ...] downloaded from a PX4 mission
+route_override: list = []  # planned route published by your flight script on /dashboard/route
 obstacle_info: dict = {}   # other code (your avoidance script) can write into this
 
 
@@ -206,6 +207,24 @@ def ros_color_to_bgr(msg):
     return None
 
 
+def route_from_json(text):
+    """Planned route from the flight script, as JSON on the ROS 2 topic /dashboard/route:
+    {"frame": "latlon", "points": [[lat, lon, alt_m], ...]}   or
+    {"frame": "ned",    "points": [[north_m, east_m, down_m], ...]}  (local PX4 frame, like trajectory_setpoint)
+    Returns [[lat, lon, alt_m], ...], or None if local points can't be placed yet (no position)."""
+    d = json.loads(text)
+    pts = d["points"]
+    if d.get("frame", "latlon") == "ned":
+        pos, ned = state.get("pos"), state.get("ned")
+        if not pos or not ned:
+            return None
+        lat0 = pos["lat"] - ned["n"] / 110540            # lat/lon of the local origin
+        lon0 = pos["lon"] - ned["e"] / (111320 * math.cos(math.radians(pos["lat"])))
+        k = 111320 * math.cos(math.radians(lat0))
+        return [[lat0 + p[0] / 110540, lon0 + p[1] / k, -p[2] if len(p) > 2 else 0.0] for p in pts]
+    return [[float(p[0]), float(p[1]), float(p[2]) if len(p) > 2 else 0.0] for p in pts]
+
+
 def start_ros2():
     import rclpy
     from rclpy.node import Node
@@ -245,6 +264,20 @@ def start_ros2():
         if color_t:
             node.create_subscription(Image, color_t, on_color, qos_profile_sensor_data)
         print(f"{name}: ROS 2 topics {depth_t}, {info_t}, {color_t}")
+    from std_msgs.msg import String
+
+    def on_route(msg):
+        global route_override
+        try:
+            r = route_from_json(msg.data)
+            if r is not None:
+                if r != route_override:
+                    print(f"route from /dashboard/route: {len(r)} waypoints")
+                route_override = r
+        except Exception as e:
+            print("bad /dashboard/route message:", e)
+
+    node.create_subscription(String, "/dashboard/route", on_route, 10)
     threading.Thread(target=rclpy.spin, args=(node,), daemon=True).start()
 
 
@@ -343,6 +376,8 @@ async def start_px4():
     for coro in (
         watch(t.position(), "pos", lambda p: {"lat": p.latitude_deg, "lon": p.longitude_deg,
                                               "alt_m": p.relative_altitude_m}),
+        watch(t.position_velocity_ned(), "ned",
+              lambda v: {"n": v.position.north_m, "e": v.position.east_m}),
         watch(t.attitude_euler(), "att", lambda a: {"roll": a.roll_deg, "pitch": a.pitch_deg,
                                                      "yaw": a.yaw_deg}),
         watch(t.velocity_ned(), "vel", lambda v: {"n": v.north_m_s, "e": v.east_m_s, "d": v.down_m_s}),
@@ -372,11 +407,13 @@ async def refresh_route(drone):
 
 # ----------------------------------------------------------------- senders
 async def send_state(ws):
-    n = 0
+    n, last_route = 0, None
     while True:
         await ws.send(json.dumps({"type": "telemetry", "t": time.time(), "avoidance": obstacle_info, **state}))
-        if n % (TELEMETRY_HZ * 5) == 0:
-            await ws.send(json.dumps({"type": "route", "points": route}))
+        current = route_override or route
+        if current != last_route or n % int(TELEMETRY_HZ * 5) == 0:   # as soon as it changes, then every ~5 s
+            await ws.send(json.dumps({"type": "route", "points": current}))
+            last_route = list(current)
         n += 1
         await asyncio.sleep(1 / TELEMETRY_HZ)
 

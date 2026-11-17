@@ -23,13 +23,13 @@
 <h1>Drone link <span id="status">offline</span></h1>
 <div class="grid">
   <div class="card" style="grid-column: 1 / -1"><div>Depth cameras</div><div id="cams" class="cams"></div></div>
+  <div class="card"><div>Route <small>(blue = planned, orange = flown)</small></div><canvas id="map" width="400" height="300"></canvas></div>
+  <div class="card"><div>Telemetry</div><pre id="tel"></pre></div>
   <div class="card" style="grid-column: 1 / -1">
     <div>3D view <select id="sel3d"><option value="">off</option></select>
     <small>(drag to rotate, wheel to zoom)</small></div>
     <canvas id="c3d" width="800" height="450"></canvas>
   </div>
-  <div class="card"><div>Route</div><canvas id="map" width="400" height="300"></canvas></div>
-  <div class="card"><div>Telemetry</div><pre id="tel"></pre></div>
 </div>
 <script>
 let route = [], pos = null, lastUrls = {}, lastMsg = 0;
@@ -59,7 +59,7 @@ function connect() {
     }
     const m = JSON.parse(ev.data);
     if (m.type === "telemetry") {
-      pos = m.pos || null;
+      pos = m.pos || null; att = m.att || null; addTrail();
       $("tel").textContent = JSON.stringify(m, null, 2);
       drawMap();
     } else if (m.type === "route") {
@@ -84,30 +84,66 @@ function connect() {
   };
 }
 
+let att = null, trail = [];
+function addTrail() {
+  if (!pos || pos.lat == null) return;
+  const last = trail[trail.length - 1];
+  if (!last || Math.hypot((pos.lat - last.lat) * 110540, (pos.lon - last.lon) * 111320) > 0.5) {
+    trail.push({ lat: pos.lat, lon: pos.lon });
+    if (trail.length > 3000) trail.shift();
+  }
+}
+
 function drawMap() {
   const c = $("map"), g = c.getContext("2d");
   g.clearRect(0, 0, c.width, c.height);
-  const pts = route.map(p => ({ lat: p[0], lon: p[1] }));
-  if (pos) pts.push({ lat: pos.lat, lon: pos.lon });
-  if (!pts.length) return;
-  const lat0 = pts[0].lat, lon0 = pts[0].lon;
-  const k = Math.cos(lat0 * Math.PI / 180);
-  const xy = pts.map(p => [(p.lon - lon0) * 111320 * k, -(p.lat - lat0) * 110540]);
-  const xs = xy.map(p => p[0]), ys = xy.map(p => p[1]);
-  const minX = Math.min(...xs), maxX = Math.max(...xs);
-  const minY = Math.min(...ys), maxY = Math.max(...ys);
-  const span = Math.max(maxX - minX, maxY - minY, 10);
-  const s = (Math.min(c.width, c.height) - 40) / span;
-  const tx = p => 20 + (p[0] - minX) * s, ty = p => 20 + (p[1] - minY) * s;
-  const n = route.length;
-  g.strokeStyle = "#4af"; g.fillStyle = "#4af"; g.beginPath();
-  xy.slice(0, n).forEach((p, i) => { i ? g.lineTo(tx(p), ty(p)) : g.moveTo(tx(p), ty(p)); });
-  g.stroke();
-  xy.slice(0, n).forEach(p => { g.beginPath(); g.arc(tx(p), ty(p), 3, 0, 7); g.fill(); });
-  if (pos) {
-    const p = xy[xy.length - 1];
-    g.fillStyle = "#f84"; g.beginPath(); g.arc(tx(p), ty(p), 6, 0, 7); g.fill();
+  g.font = "13px sans-serif"; g.textBaseline = "middle";
+  const wps = route.map(p => ({ lat: p[0], lon: p[1] }));
+  const cur = pos && pos.lat != null ? { lat: pos.lat, lon: pos.lon } : null;
+  let far = null;                                     // drone far from the route (e.g. simulator home elsewhere)
+  if (cur && wps.length) {
+    const d = Math.hypot((cur.lat - wps[0].lat) * 110540,
+                         (cur.lon - wps[0].lon) * 111320 * Math.cos(wps[0].lat * Math.PI / 180));
+    if (d > 5000) far = d;
   }
+  const all = wps.concat(far ? [] : trail, cur && !far ? [cur] : []);
+  if (!all.length) { g.fillStyle = "#888"; g.fillText("No route or position yet", 20, c.height / 2); return; }
+  const lat0 = all[0].lat, lon0 = all[0].lon, k = Math.cos(lat0 * Math.PI / 180);
+  const xy = p => [(p.lon - lon0) * 111320 * k, -(p.lat - lat0) * 110540];
+  const P = all.map(xy), xs = P.map(p => p[0]), ys = P.map(p => p[1]);
+  const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+  const span = Math.max(maxX - minX, maxY - minY, 10), s = (Math.min(c.width, c.height) - 60) / span;
+  const ox = (c.width - (maxX - minX) * s) / 2, oy = (c.height - (maxY - minY) * s) / 2;
+  const pt = p => { const q = xy(p); return [ox + (q[0] - minX) * s, oy + (q[1] - minY) * s]; };
+  if (wps.length) {                                   // planned route
+    g.strokeStyle = "#4af"; g.lineWidth = 2; g.beginPath();
+    wps.forEach((p, i) => { const [x, y] = pt(p); i ? g.lineTo(x, y) : g.moveTo(x, y); });
+    g.stroke();
+    wps.forEach((p, i) => {
+      const [x, y] = pt(p);
+      g.fillStyle = "#4af"; g.beginPath(); g.arc(x, y, 4, 0, 7); g.fill();
+      g.fillStyle = "#ccc"; g.fillText(String(i + 1), x + 7, y - 7);
+    });
+  }
+  if (trail.length > 1 && !far) {                             // where the drone has actually been
+    g.strokeStyle = "#f84"; g.lineWidth = 1.5; g.beginPath();
+    trail.forEach((p, i) => { const [x, y] = pt(p); i ? g.lineTo(x, y) : g.moveTo(x, y); });
+    g.stroke();
+  }
+  if (cur && !far) {                                  // the drone, with its heading
+    const [x, y] = pt(cur);
+    g.fillStyle = "#f84"; g.beginPath(); g.arc(x, y, 6, 0, 7); g.fill();
+    if (att) {
+      const a = att.yaw * Math.PI / 180;
+      g.strokeStyle = "#fff"; g.lineWidth = 2; g.beginPath();
+      g.moveTo(x, y); g.lineTo(x + 16 * Math.sin(a), y - 16 * Math.cos(a)); g.stroke();
+    }
+  }
+  if (far) {
+    g.fillStyle = "#f84";
+    g.fillText("Drone is " + Math.round(far / 1000) + " km from this route: check the simulator home location", 10, 16);
+  }
+  g.fillStyle = "#888"; g.fillText("view about " + Math.round(span) + " m across, north is up", 10, c.height - 10);
 }
 
 function sendView() {
