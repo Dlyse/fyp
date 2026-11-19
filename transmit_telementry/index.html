@@ -21,6 +21,7 @@
 </head>
 <body>
 <h1>Drone link <span id="status">offline</span></h1>
+<p><button id="saveBtn">Save last 5 min</button> <small id="recInfo"></small></p>
 <div class="grid">
   <div class="card" style="grid-column: 1 / -1"><div>Depth cameras</div><div id="cams" class="cams"></div></div>
   <div class="card"><div>Route <small>(blue = planned, orange = flown)</small></div><canvas id="map" width="400" height="300"></canvas></div>
@@ -59,11 +60,15 @@ function connect() {
     }
     const m = JSON.parse(ev.data);
     if (m.type === "telemetry") {
-      pos = m.pos || null; att = m.att || null; addTrail();
+      pos = m.pos || null; att = m.att || null; addTrail(); rec = m.rec || null; showRec();
       $("tel").textContent = JSON.stringify(m, null, 2);
       drawMap();
     } else if (m.type === "route") {
       route = m.points; drawMap();
+    } else if (m.type === "rec_status") {
+      recMsg = m.state === "saving" ? "saving..." : m.state === "error" ? "save failed: " + m.msg : "";
+      if (m.state === "saved") { rec = rec || {}; rec.last = m.dir; }
+      showRec();
     } else if (m.type === "depth3d") {
       meta3d[m.cam] = m;
     } else if (m.type === "cameras") {
@@ -259,6 +264,19 @@ async function showRgb(idx, bytes) {
     }
   } catch (e) { /* skip a bad frame */ } finally { s.busy = false; }
 }
+let rec = null, recMsg = "";
+function showRec() {
+  const s = rec ? rec.buffered_s : 0;
+  $("recInfo").textContent = (recMsg ? recMsg + " | " : "") + "buffered " + Math.floor(s / 60) + ":" +
+    String(s % 60).padStart(2, "0") + (rec && rec.last ? " | last saved: " + rec.last : "");
+  $("saveBtn").disabled = recMsg === "saving...";
+}
+$("saveBtn").onclick = () => {
+  if (!wsRef || wsRef.readyState !== 1) return;
+  wsRef.send(JSON.stringify({ type: "rec_save" }));
+  recMsg = "saving..."; showRec();
+};
+
 setInterval(() => {
   for (const [i, s] of Object.entries(rgbState)) {
     const el = $("fps-" + i);

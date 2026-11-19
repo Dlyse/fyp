@@ -22,6 +22,7 @@ import time
 import cv2
 import numpy as np
 import threading
+from collections import deque
 import websockets
 from mavsdk import System
 
@@ -29,15 +30,18 @@ SERVER_URL = os.environ.get("SERVER_URL", "ws://192.168.1.50:8000/ws/drone")
 TOKEN = os.environ.get("DRONE_TOKEN", "change-me")
 MAV_ADDR = os.environ.get("MAV_ADDR", "udpin://0.0.0.0:14540")
 
-def _hz(name, default):
-    return float(os.environ.get(name, default))
+CELL = os.environ.get("LINK_PROFILE", "wifi") == "cellular"   # LINK_PROFILE=cellular: low-data defaults
+
+
+def _hz(name, wifi, cell=None):
+    return float(os.environ.get(name, cell if (CELL and cell is not None) else wifi))
 
 
 # Update rates, all adjustable from the command line, e.g.  DEPTH3D_ALL_HZ=2 IMG_HZ=2 python ...
 # Defaults suit WiFi / simulation. For a cellular link use something like 1-2 for the image rates.
-TELEMETRY_HZ = _hz("TELEMETRY_HZ", 5)
-OBS_HZ = _hz("OBS_HZ", 10)      # obstacle summary rate, per camera
-IMG_HZ = _hz("IMG_HZ", 5)       # greyscale depth preview rate, per camera
+TELEMETRY_HZ = _hz("TELEMETRY_HZ", 5, 2)
+OBS_HZ = _hz("OBS_HZ", 10, 2)      # obstacle summary rate, per camera
+IMG_HZ = _hz("IMG_HZ", 5, 1)       # greyscale depth preview rate, per camera
 DEPTH_MAX_MM = 6000        # colour-map range
 IMG_SIZE = (320, 180)      # width, height sent to the website
 JPEG_QUALITY = 60
@@ -64,8 +68,8 @@ latest: dict = {}   # camera name -> newest uint16 depth image in mm
 INTR: dict = {}     # camera name -> (fx, fy, cx, cy) at native resolution
 view3d = None       # camera the website wants as a 3D point cloud (None = off)
 rgb_cam = None      # camera the website wants as live RGB video: a name, "all", or None = off
-RGB_FPS = _hz("RGB_FPS", 30)                    # frame-rate cap per camera for the RGB video
-RGB_QUALITY = int(_hz("RGB_QUALITY", 70))       # JPEG quality of the RGB video feed
+RGB_FPS = _hz("RGB_FPS", 30, 2)                    # frame-rate cap per camera for the RGB video
+RGB_QUALITY = int(_hz("RGB_QUALITY", 70, 50))       # JPEG quality of the RGB video feed
 latest_rgb: dict = {}                           # camera name -> newest BGR frame
 rgb_seq: dict = {}                              # camera name -> frame counter
 LOOP = None                                     # asyncio loop and event, set in main()
@@ -84,10 +88,108 @@ def push_rgb(name, bgr):
         LOOP.call_soon_threadsafe(rgb_event.set)
 
 
-DEPTH3D_HZ = _hz("DEPTH3D_HZ", 8)          # one camera chosen in 3D view
-DEPTH3D_ALL_HZ = _hz("DEPTH3D_ALL_HZ", 5)  # per camera when the page asks for "all"
+DEPTH3D_HZ = _hz("DEPTH3D_HZ", 8, 1)          # one camera chosen in 3D view
+DEPTH3D_ALL_HZ = _hz("DEPTH3D_ALL_HZ", 5, 0.5)  # per camera when the page asks for "all"
 latest_color: dict = {}  # camera name -> (timestamp, BGR image aligned to the depth image)
 ACTIVE: list = []   # (name, role) of cameras actually started; only these are sent
+
+
+# ------------------------------------------------------------ rolling recorder (Save button)
+REC_SECONDS = _hz("REC_SECONDS", 300)            # history kept for the Save button
+REC_FPS = _hz("REC_FPS", 2)                      # recording rate per camera (low on purpose)
+REC_QUALITY = int(_hz("REC_QUALITY", 60))
+REC_DIR = os.path.expanduser(os.environ.get("REC_DIR", "~/recordings"))
+rec_buf: dict = {}      # camera -> deque of (time, rgb jpeg or None, depth jpeg or None)
+rec_need: dict = {}     # camera -> True while the recorder wants the next colour frame
+rec_rgb: dict = {}      # camera -> colour frame captured for the recorder
+saving = False
+viewers_n = 1           # open dashboard pages, told by the server (0 = send no previews)
+
+
+def _rec_encode(rgb, depth_mm):
+    q = [cv2.IMWRITE_JPEG_QUALITY, REC_QUALITY]
+    r = cv2.imencode(".jpg", rgb, q)[1].tobytes() if rgb is not None else None
+    d = None
+    if depth_mm is not None:                     # same greyscale look as the dashboard
+        g = (255 - np.clip(depth_mm.astype(np.float32) / DEPTH_MAX_MM * 225, 0, 225)).astype(np.uint8)
+        g[depth_mm == 0] = 0
+        d = cv2.imencode(".jpg", g, q)[1].tobytes()
+    return r, d
+
+
+async def recorder():
+    """Runs all the time, even with the link down: keeps the last REC_SECONDS of RGB + depth."""
+    while True:
+        t0 = time.time()
+        for name, _ in list(ACTIVE):
+            rgb = rec_rgb.pop(name, None)
+            rec_need[name] = True                # ask the camera for its next colour frame
+            r, d = await asyncio.to_thread(_rec_encode, rgb, latest.get(name))
+            buf = rec_buf.setdefault(name, deque())
+            buf.append((t0, r, d))
+            while buf and t0 - buf[0][0] > REC_SECONDS:
+                buf.popleft()
+        span = max((b[-1][0] - b[0][0] for b in rec_buf.values() if b), default=0)
+        state["rec"] = {"buffered_s": round(span), "saving": saving, "last": state.get("rec", {}).get("last")}
+        await asyncio.sleep(max(0, 1 / REC_FPS - (time.time() - t0)))
+
+
+def save_recording():
+    """Write the buffered window to REC_DIR/<date_time>/ as one mp4 per camera and stream."""
+    snap = {n: list(b) for n, b in rec_buf.items() if b}
+    if not snap:
+        raise RuntimeError("nothing recorded yet")
+    out = os.path.join(REC_DIR, time.strftime("%Y%m%d_%H%M%S"))
+    os.makedirs(out, exist_ok=True)
+    total = 0
+    for name, frames in snap.items():
+        for kind, i in (("rgb", 1), ("depth", 2)):
+            jpgs = [f[i] for f in frames if f[i] is not None]
+            if not jpgs:
+                continue
+            imgs = [cv2.imdecode(np.frombuffer(j, np.uint8), cv2.IMREAD_COLOR) for j in jpgs]
+            h, w = imgs[0].shape[:2]
+            vw = cv2.VideoWriter(os.path.join(out, f"{name}_{kind}.mp4"),
+                                 cv2.VideoWriter_fourcc(*"mp4v"), REC_FPS, (w, h))
+            if vw.isOpened():
+                for im in imgs:
+                    vw.write(im)
+                vw.release()
+            else:                                # this OpenCV has no video codec: save JPEG images instead
+                folder = os.path.join(out, f"{name}_{kind}")
+                os.makedirs(folder, exist_ok=True)
+                for k, j in enumerate(jpgs):
+                    with open(os.path.join(folder, f"{k:05d}.jpg"), "wb") as fh:
+                        fh.write(j)
+            total += len(jpgs)
+    seconds = max(f[-1][0] - f[0][0] for f in snap.values())
+    with open(os.path.join(out, "info.json"), "w") as fh:
+        json.dump({"fps": REC_FPS, "seconds": round(seconds), "cameras": list(snap),
+                   "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}, fh)
+    return {"dir": out, "seconds": round(seconds), "frames": total}
+
+
+async def do_save(ws):
+    global saving
+    if saving:
+        return
+
+    async def say(**kw):
+        try:
+            await ws.send(json.dumps({"type": "rec_status", **kw}))
+        except Exception:
+            pass
+
+    saving = True
+    await say(state="saving")
+    try:
+        info = await asyncio.to_thread(save_recording)
+        state.setdefault("rec", {})["last"] = info["dir"]
+        await say(state="saved", **info)
+    except Exception as e:
+        await say(state="error", msg=str(e))
+    finally:
+        saving = False
 
 
 def wants3d(name):
@@ -127,6 +229,11 @@ def realsense_reader(name, serial):
                     cf = fs.get_color_frame()
                     if cf:
                         push_rgb(name, np.asanyarray(cf.get_data()).copy())
+                if use_color and rec_need.get(name):
+                    cf = fs.get_color_frame()
+                    if cf:
+                        rec_rgb[name] = np.asanyarray(cf.get_data()).copy()
+                        rec_need[name] = False
                 if use_color and wants3d(name):       # only align cameras being viewed in 3D
                     fs = align.process(fs)
                     c = fs.get_color_frame()
@@ -155,7 +262,7 @@ def fake_reader(name, i):
     while True:
         d = 2000 + 1500 * np.sin(x / 40.0 + i) + 800 * np.cos(y / 30.0 + time.time())
         latest[name] = d.astype(np.uint16)
-        if wants3d(name) or wantsrgb(name):   # fake colour image for testing
+        if wants3d(name) or wantsrgb(name) or rec_need.get(name):   # fake colour image for testing
             c = np.zeros((h, w, 3), np.uint8)
             c[:, :, 0] = (x * 255 // w).astype(np.uint8)
             c[:, :, 1] = (y * 255 // h).astype(np.uint8)
@@ -164,6 +271,9 @@ def fake_reader(name, i):
                 latest_color[name] = (time.time(), c)
             if wantsrgb(name):
                 push_rgb(name, c)
+            if rec_need.get(name):
+                rec_rgb[name] = c
+                rec_need[name] = False
         time.sleep(1 / RS_FPS)
 
 
@@ -248,9 +358,9 @@ def start_ros2():
             INTR[name] = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])
 
         def on_color(msg, name=name):
-            want3, wantrgb = wants3d(name), wantsrgb(name)
-            if not (want3 or wantrgb):
-                return                      # nobody is looking: skip the conversion
+            want3, wantrgb, needrec = wants3d(name), wantsrgb(name), rec_need.get(name, False)
+            if not (want3 or wantrgb or needrec):
+                return                      # nobody needs it: skip the conversion
             c = ros_color_to_bgr(msg)
             if c is None:
                 return
@@ -258,6 +368,9 @@ def start_ros2():
                 latest_color[name] = (time.time(), c)
             if wantrgb:
                 push_rgb(name, c)
+            if needrec:
+                rec_rgb[name] = c
+                rec_need[name] = False
 
         node.create_subscription(Image, depth_t, on_depth, qos_profile_sensor_data)
         node.create_subscription(CameraInfo, info_t, on_info, qos_profile_sensor_data)
@@ -423,6 +536,9 @@ async def send_depth(ws):
     last_obs, last_img, last3d = {}, {}, {}
     while True:
         t0 = time.time()
+        if viewers_n == 0:                 # nobody has the dashboard open: save the data
+            await asyncio.sleep(0.25)
+            continue
         names = [c[0] for c in ACTIVE]
         jobs = []
         for idx, (name, role) in enumerate(ACTIVE):
@@ -483,7 +599,7 @@ async def send_rgb(ws):
 
 
 async def recv_loop(ws):
-    global view3d, rgb_cam
+    global view3d, rgb_cam, viewers_n
     async for msg in ws:
         if isinstance(msg, str):
             try:
@@ -493,6 +609,10 @@ async def recv_loop(ws):
             if m.get("type") == "view3d":
                 view3d = m.get("cam")
                 print("3D view:", view3d)
+            elif m.get("type") == "viewers":
+                viewers_n = int(m.get("n", 1))
+            elif m.get("type") == "rec_save":
+                asyncio.create_task(do_save(ws))
             elif m.get("type") == "rgb":
                 rgb_cam = m.get("cam")
                 print("RGB view:", rgb_cam)
@@ -552,6 +672,7 @@ async def main():
     LOOP = asyncio.get_running_loop()
     rgb_event = asyncio.Event()
     await asyncio.to_thread(start_cameras)
+    asyncio.create_task(recorder())
     if os.environ.get("NO_PX4") == "1":
         asyncio.create_task(fake_px4())
     else:
