@@ -66,6 +66,7 @@ function connect() {
     } else if (m.type === "route") {
       route = m.points; drawMap();
     } else if (m.type === "rec_status") {
+      clearTimeout(recTimer);
       recMsg = m.state === "saving" ? "saving..." : m.state === "error" ? "save failed: " + m.msg : "";
       if (m.state === "saved") { rec = rec || {}; rec.last = m.dir; }
       showRec();
@@ -264,17 +265,21 @@ async function showRgb(idx, bytes) {
     }
   } catch (e) { /* skip a bad frame */ } finally { s.busy = false; }
 }
-let rec = null, recMsg = "";
+let rec = null, recMsg = "", recTimer = null;
 function showRec() {
   const s = rec ? rec.buffered_s : 0;
   $("recInfo").textContent = (recMsg ? recMsg + " | " : "") + "buffered " + Math.floor(s / 60) + ":" +
-    String(s % 60).padStart(2, "0") + (rec && rec.last ? " | last saved: " + rec.last : "");
+    String(s % 60).padStart(2, "0") + (rec && rec.last ? " | last saved on the drone computer: " + rec.last : "");
   $("saveBtn").disabled = recMsg === "saving...";
 }
 $("saveBtn").onclick = () => {
   if (!wsRef || wsRef.readyState !== 1) return;
   wsRef.send(JSON.stringify({ type: "rec_save" }));
   recMsg = "saving..."; showRec();
+  clearTimeout(recTimer);               // the drone should answer within a few seconds
+  recTimer = setTimeout(() => {
+    if (recMsg === "saving...") { recMsg = "no answer from the drone: is drone_client.py updated and running?"; showRec(); }
+  }, 6000);
 };
 
 setInterval(() => {

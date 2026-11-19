@@ -103,6 +103,7 @@ rec_buf: dict = {}      # camera -> deque of (time, rgb jpeg or None, depth jpeg
 rec_need: dict = {}     # camera -> True while the recorder wants the next colour frame
 rec_rgb: dict = {}      # camera -> colour frame captured for the recorder
 saving = False
+bg_tasks: set = set()
 viewers_n = 1           # open dashboard pages, told by the server (0 = send no previews)
 
 
@@ -126,7 +127,8 @@ async def recorder():
             rec_need[name] = True                # ask the camera for its next colour frame
             r, d = await asyncio.to_thread(_rec_encode, rgb, latest.get(name))
             buf = rec_buf.setdefault(name, deque())
-            buf.append((t0, r, d))
+            if r or d:                           # skip ticks where the camera gave nothing
+                buf.append((t0, r, d))
             while buf and t0 - buf[0][0] > REC_SECONDS:
                 buf.popleft()
         span = max((b[-1][0] - b[0][0] for b in rec_buf.values() if b), default=0)
@@ -138,7 +140,7 @@ def save_recording():
     """Write the buffered window to REC_DIR/<date_time>/ as one mp4 per camera and stream."""
     snap = {n: list(b) for n, b in rec_buf.items() if b}
     if not snap:
-        raise RuntimeError("nothing recorded yet")
+        raise RuntimeError("no camera frames recorded yet (are the camera topics publishing?)")
     out = os.path.join(REC_DIR, time.strftime("%Y%m%d_%H%M%S"))
     os.makedirs(out, exist_ok=True)
     total = 0
@@ -181,12 +183,15 @@ async def do_save(ws):
             pass
 
     saving = True
+    print("Save requested from the dashboard...")
     await say(state="saving")
     try:
         info = await asyncio.to_thread(save_recording)
         state.setdefault("rec", {})["last"] = info["dir"]
+        print(f"recording saved: {info}")
         await say(state="saved", **info)
     except Exception as e:
+        print(f"recording save failed: {e!r}")
         await say(state="error", msg=str(e))
     finally:
         saving = False
@@ -612,7 +617,9 @@ async def recv_loop(ws):
             elif m.get("type") == "viewers":
                 viewers_n = int(m.get("n", 1))
             elif m.get("type") == "rec_save":
-                asyncio.create_task(do_save(ws))
+                task = asyncio.create_task(do_save(ws))
+                bg_tasks.add(task)
+                task.add_done_callback(bg_tasks.discard)
             elif m.get("type") == "rgb":
                 rgb_cam = m.get("cam")
                 print("RGB view:", rgb_cam)
