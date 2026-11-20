@@ -14,7 +14,7 @@ from urllib.parse import parse_qs
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 
-TOKEN = os.environ.get("DRONE_TOKEN", "change-me")                  # the drone's secret
+TOKEN = os.environ.get("DRONE_TOKEN", "duck")                  # the drone's secret
 VIEWER_PASSWORD = os.environ.get("VIEWER_PASSWORD", "")             # empty = no login (local testing only)
 HERE = os.path.dirname(os.path.abspath(__file__))
 if VIEWER_PASSWORD and TOKEN == "change-me":
