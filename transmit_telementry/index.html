@@ -1,301 +1,32 @@
 <!DOCTYPE html>
 <html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Drone link</title>
-<style>
-  body { font-family: system-ui, sans-serif; margin: 16px; background: #111; color: #eee; }
-  h1 { font-size: 18px; margin: 0 0 12px; }
-  #status { padding: 2px 8px; border-radius: 10px; background: #a33; font-size: 13px; }
-  #status.up { background: #2a7; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
-  .card { background: #1c1c1c; border-radius: 8px; padding: 12px; }
-  img, canvas { width: 100%; background: #000; border-radius: 4px; image-rendering: pixelated; }
-  .cams { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; }
-  .cam div { font-size: 12px; }
-  .cam canvas, .cam img { margin-bottom: 4px; }
-  canvas.rgb { image-rendering: auto; }
-  pre { margin: 0; font-size: 13px; white-space: pre-wrap; }
-</style>
-</head>
-<body>
-<h1>Drone link <span id="status">offline</span></h1>
-<p><button id="saveBtn">Save last 5 min</button> <small id="recInfo"></small></p>
-<div class="grid">
-  <div class="card" style="grid-column: 1 / -1"><div>Depth cameras</div><div id="cams" class="cams"></div></div>
-  <div class="card"><div>Route <small>(blue = planned, orange = flown)</small></div><canvas id="map" width="400" height="300"></canvas></div>
-  <div class="card"><div>Telemetry</div><pre id="tel"></pre></div>
-  <div class="card" style="grid-column: 1 / -1">
-    <div>3D view <select id="sel3d"><option value="">off</option></select>
-    <small>(drag to rotate, wheel to zoom)</small></div>
-    <canvas id="c3d" width="800" height="450"></canvas>
-  </div>
-</div>
-<script>
-let route = [], pos = null, lastUrls = {}, lastMsg = 0;
-let camNames = [], meta3d = {}, want3d = "all", wantRgb = "all", wsRef = null, clouds = {};
-const $ = id => document.getElementById(id);
 
-function connect() {
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${proto}://${location.host}/ws/view`);
-  ws.binaryType = "arraybuffer";
-  wsRef = ws;
-  ws.onopen = sendView;
-  ws.onclose = () => { setTimeout(connect, 2000); };
-  ws.onmessage = ev => {
-    lastMsg = Date.now();
-    if (typeof ev.data !== "string") {
-      const b = new Uint8Array(ev.data);
-      const img = b[1] === 0 ? $("img-" + b[0]) : null;
-      if (b[1] === 1) { showCloud(camNames[b[0]], b.subarray(2)); return; }
-      if (b[1] === 2) { showRgb(b[0], b.subarray(2)); return; }
-      if (!img) return;
-      const url = URL.createObjectURL(new Blob([b.subarray(2)], { type: "image/jpeg" }));
-      img.src = url;
-      if (lastUrls[b[0]]) URL.revokeObjectURL(lastUrls[b[0]]);
-      lastUrls[b[0]] = url;
-      return;
-    }
-    const m = JSON.parse(ev.data);
-    if (m.type === "telemetry") {
-      pos = m.pos || null; att = m.att || null; addTrail(); rec = m.rec || null; showRec();
-      $("tel").textContent = JSON.stringify(m, null, 2);
-      drawMap();
-    } else if (m.type === "route") {
-      route = m.points; drawMap();
-    } else if (m.type === "rec_status") {
-      clearTimeout(recTimer);
-      recMsg = m.state === "saving" ? "saving..." : m.state === "error" ? "save failed: " + m.msg : "";
-      if (m.state === "saved") { rec = rec || {}; rec.last = m.dir; }
-      showRec();
-    } else if (m.type === "depth3d") {
-      meta3d[m.cam] = m;
-    } else if (m.type === "cameras") {
-      $("cams").innerHTML = m.names.map((n, i) =>
-        `<div class="cam"><div>${n} <small id="fps-${i}"></small></div><canvas class="rgb" id="rgb-${i}" width="640" height="480"></canvas><img id="img-${i}" alt="${n}"><div id="obs-${n}"></div></div>`).join("");
-      camNames = m.names;
-      $("sel3d").innerHTML = `<option value="">off</option><option value="all">all cameras</option>` + m.names.map(n => `<option>${n}</option>`).join("");
-      $("sel3d").value = want3d;
-      sendView();
-    } else if (m.type === "obstacle") {
-      const el = $("obs-" + m.cam);
-      if (el) el.textContent = m.role === "land"
-        ? `ground ${m.ground_m} m | min ${m.min_m} m`
-        : `min ${m.min_m} m | L ${m.left_m} | C ${m.center_m} | R ${m.right_m}`;
-    } else if (m.type === "link" && !m.up) {
-      lastMsg = 0;
-    }
-  };
-}
+  <head>
+    <meta charset="utf-8">                                                <!-- makes special characters display correctly -->
+    <meta name="viewport" content="width=device-width, initial-scale=1">  <!-- fix scaling on phones -->
+    <link rel="stylesheet" href="styles.css">
+    <title>Title</title>
+  </head>
 
-let att = null, trail = [];
-function addTrail() {
-  if (!pos || pos.lat == null) return;
-  const last = trail[trail.length - 1];
-  if (!last || Math.hypot((pos.lat - last.lat) * 110540, (pos.lon - last.lon) * 111320) > 0.5) {
-    trail.push({ lat: pos.lat, lon: pos.lon });
-    if (trail.length > 3000) trail.shift();
-  }
-}
+  <body>
+    <h1>Drone link <span id="statusoff">offline</span></h1>
 
-function drawMap() {
-  const c = $("map"), g = c.getContext("2d");
-  g.clearRect(0, 0, c.width, c.height);
-  g.font = "13px sans-serif"; g.textBaseline = "middle";
-  const wps = route.map(p => ({ lat: p[0], lon: p[1] }));
-  const cur = pos && pos.lat != null ? { lat: pos.lat, lon: pos.lon } : null;
-  let far = null;                                     // drone far from the route (e.g. simulator home elsewhere)
-  if (cur && wps.length) {
-    const d = Math.hypot((cur.lat - wps[0].lat) * 110540,
-                         (cur.lon - wps[0].lon) * 111320 * Math.cos(wps[0].lat * Math.PI / 180));
-    if (d > 5000) far = d;
-  }
-  const all = wps.concat(far ? [] : trail, cur && !far ? [cur] : []);
-  if (!all.length) { g.fillStyle = "#888"; g.fillText("No route or position yet", 20, c.height / 2); return; }
-  const lat0 = all[0].lat, lon0 = all[0].lon, k = Math.cos(lat0 * Math.PI / 180);
-  const xy = p => [(p.lon - lon0) * 111320 * k, -(p.lat - lat0) * 110540];
-  const P = all.map(xy), xs = P.map(p => p[0]), ys = P.map(p => p[1]);
-  const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
-  const span = Math.max(maxX - minX, maxY - minY, 10), s = (Math.min(c.width, c.height) - 60) / span;
-  const ox = (c.width - (maxX - minX) * s) / 2, oy = (c.height - (maxY - minY) * s) / 2;
-  const pt = p => { const q = xy(p); return [ox + (q[0] - minX) * s, oy + (q[1] - minY) * s]; };
-  if (wps.length) {                                   // planned route
-    g.strokeStyle = "#4af"; g.lineWidth = 2; g.beginPath();
-    wps.forEach((p, i) => { const [x, y] = pt(p); i ? g.lineTo(x, y) : g.moveTo(x, y); });
-    g.stroke();
-    wps.forEach((p, i) => {
-      const [x, y] = pt(p);
-      g.fillStyle = "#4af"; g.beginPath(); g.arc(x, y, 4, 0, 7); g.fill();
-      g.fillStyle = "#ccc"; g.fillText(String(i + 1), x + 7, y - 7);
-    });
-  }
-  if (trail.length > 1 && !far) {                             // where the drone has actually been
-    g.strokeStyle = "#f84"; g.lineWidth = 1.5; g.beginPath();
-    trail.forEach((p, i) => { const [x, y] = pt(p); i ? g.lineTo(x, y) : g.moveTo(x, y); });
-    g.stroke();
-  }
-  if (cur && !far) {                                  // the drone, with its heading
-    const [x, y] = pt(cur);
-    g.fillStyle = "#f84"; g.beginPath(); g.arc(x, y, 6, 0, 7); g.fill();
-    if (att) {
-      const a = att.yaw * Math.PI / 180;
-      g.strokeStyle = "#fff"; g.lineWidth = 2; g.beginPath();
-      g.moveTo(x, y); g.lineTo(x + 16 * Math.sin(a), y - 16 * Math.cos(a)); g.stroke();
-    }
-  }
-  if (far) {
-    g.fillStyle = "#f84";
-    g.fillText("Drone is " + Math.round(far / 1000) + " km from this route: check the simulator home location", 10, 16);
-  }
-  g.fillStyle = "#888"; g.fillText("view about " + Math.round(span) + " m across, north is up", 10, c.height - 10);
-}
+    <p><button id="saveBtn">Save last 5 min</button> <small id="recInfo"></small></p>
 
-function sendView() {
-  if (!wsRef || wsRef.readyState !== 1) return;
-  wsRef.send(JSON.stringify({ type: "view3d", cam: want3d || null }));
-  wsRef.send(JSON.stringify({ type: "rgb", cam: wantRgb || null }));
-}
-$("sel3d").onchange = e => { want3d = e.target.value; clouds = {}; view.dist = want3d === "all" ? 9 : 5; sendView(); render(); };
+    <div class="grid"> <!-- grid container [order doesnt matter]-->
+      <div class="card a-cams"><div>Depth cameras</div><div id="cams" class="cams"></div></div>
+      <div class="card a-route"><div>Route <small>(blue = planned, orange = flown)</small></div><canvas id="map" width="400" height="300"></canvas></div>
+      <div class="card a-data"><div>Telemetry</div><pre id="tel"></pre></div>
+      <div class="card a-3d">
+        <div>3D view <select id="sel3d"><option value="">off</option></select>
+        <small>(drag to rotate, wheel to zoom)</small></div>
+        <canvas id="c3d" width="800" height="450"></canvas>
+      </div>
+    </div>
 
-async function decode(bytes, type, w, h) {
-  const bmp = await createImageBitmap(new Blob([bytes], { type }), { colorSpaceConversion: "none" });
-  const oc = document.createElement("canvas");
-  oc.width = w; oc.height = h;
-  const og = oc.getContext("2d", { willReadFrequently: true });
-  og.drawImage(bmp, 0, 0, w, h);
-  return og.getImageData(0, 0, w, h).data;
-}
+    <script src="app.js"></script>
+  </body>
 
-async function showCloud(cam, bytes) {
-  const m = meta3d[cam];
-  if (!m) return;
-  const n1 = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(0);
-  const png = bytes.subarray(4, 4 + n1), jpg = bytes.subarray(4 + n1);
-  const px = await decode(png, "image/png", m.w, m.h);
-  const cpx = jpg.length ? await decode(jpg, "image/jpeg", m.w, m.h) : null;
-  const pts = new Float32Array(m.w * m.h * 3), col = new Uint32Array(m.w * m.h);
-  let n = 0;
-  for (let v = 0; v < m.h; v++) for (let u = 0; u < m.w; u++) {
-    const i = (v * m.w + u) * 4, d = ((px[i] << 8) | px[i + 1]) / 1000;
-    if (d < 0.1 || d > 8) continue;
-    pts[n * 3] = (u - m.cx) * d / m.fx;
-    pts[n * 3 + 1] = -(v - m.cy) * d / m.fy;
-    pts[n * 3 + 2] = d;
-    // real colour (grey by distance if no colour), dimmed slightly with distance for depth cue
-    const s = 1 - 0.35 * Math.min(d / 6, 1);
-    const r = cpx ? cpx[i] * s : 255 * s, g = cpx ? cpx[i + 1] * s : 255 * s, b = cpx ? cpx[i + 2] * s : 255 * s;
-    col[n++] = ((255 << 24) | ((b | 0) << 16) | ((g | 0) << 8) | (r | 0)) >>> 0;
-  }
-  clouds[cam] = { pts, col, n, t: Date.now() };
-  scheduleRender();
-}
 
-const CAM_YAW = { front: 0, right: 90, back: 180, left: 270 };   // mounting direction, degrees clockwise from above
-const view = { yaw: 0.6, pitch: 0.5, dist: 9 };
-function render() {
-  const c = $("c3d"), g = c.getContext("2d"), W = c.width, H = c.height;
-  const img = g.createImageData(W, H), buf = new Uint32Array(img.data.buffer);
-  buf.fill(0xff111111);
-  const merged = want3d === "all", now = Date.now();
-  const list = merged ? Object.entries(clouds) : (clouds[want3d] ? [[want3d, clouds[want3d]]] : []);
-  const zb = new Float32Array(W * H).fill(1e9), f = H * 0.9;
-  const cyw = Math.cos(view.yaw), syw = Math.sin(view.yaw), cp = Math.cos(view.pitch), sp = Math.sin(view.pitch);
-  for (const [cam, cl] of list) {
-    if (now - cl.t > 5000) continue;                       // camera stopped sending
-    if (merged && CAM_YAW[cam] === undefined) continue;    // no known mounting direction
-    const th = merged ? CAM_YAW[cam] * Math.PI / 180 : 0, cc = Math.cos(th), sc = Math.sin(th);
-    const pz = merged ? 0 : 2;                             // look at the drone, or 2 m in front of one camera
-    for (let k = 0; k < cl.n; k++) {
-      const x = cl.pts[k * 3], y0 = cl.pts[k * 3 + 1], z = cl.pts[k * 3 + 2] - pz;
-      const xb = cc * x + sc * z, zc = -sc * x + cc * z;   // camera frame -> drone frame
-      const x1 = cyw * xb + syw * zc, z1 = -syw * xb + cyw * zc;
-      const y2 = cp * y0 - sp * z1, z2 = sp * y0 + cp * z1, zz = z2 + view.dist;
-      if (zz < 0.1) continue;
-      const sx = (W / 2 + f * x1 / zz) | 0, sy = (H / 2 - f * y2 / zz) | 0;
-      for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++) {
-        const X = sx + dx, Y = sy + dy;
-        if (X < 0 || Y < 0 || X >= W || Y >= H) continue;
-        const j = Y * W + X;
-        if (zz < zb[j]) { zb[j] = zz; buf[j] = cl.col[k]; }
-      }
-    }
-  }
-  g.putImageData(img, 0, 0);
-  if (merged) { g.fillStyle = "#fff"; g.fillRect(W / 2 - 3, H / 2 - 3, 6, 6); }   // the drone
-}
-let renderPending = false;
-function scheduleRender() {          // draw at most once per screen refresh, however many clouds arrive
-  if (renderPending) return;
-  renderPending = true;
-  requestAnimationFrame(() => { renderPending = false; render(); });
-}
-let drag = null;
-$("c3d").onmousedown = e => { drag = [e.clientX, e.clientY]; };
-window.onmouseup = () => { drag = null; };
-window.onmousemove = e => {
-  if (!drag) return;
-  view.yaw += (e.clientX - drag[0]) * 0.01;
-  view.pitch += (e.clientY - drag[1]) * 0.01;
-  drag = [e.clientX, e.clientY];
-  scheduleRender();
-};
-$("c3d").onwheel = e => { e.preventDefault(); view.dist = Math.max(1, view.dist * (e.deltaY > 0 ? 1.1 : 0.9)); scheduleRender(); };
-render();
-
-const rgbState = {};   // per camera: decoding flag, newest waiting frame, frame counter
-async function showRgb(idx, bytes) {
-  const s = rgbState[idx] || (rgbState[idx] = { busy: false, next: null, count: 0 });
-  if (s.busy) { s.next = bytes; return; }   // still decoding: keep only the newest waiting frame
-  s.busy = true;
-  try {
-    let cur = bytes;
-    while (cur) {
-      s.next = null;
-      const bmp = await createImageBitmap(new Blob([cur], { type: "image/jpeg" }));
-      const c = $("rgb-" + idx);
-      if (c) {
-        if (c.width !== bmp.width || c.height !== bmp.height) { c.width = bmp.width; c.height = bmp.height; }
-        c.getContext("2d").drawImage(bmp, 0, 0);
-      }
-      bmp.close();
-      s.count++;
-      cur = s.next;
-    }
-  } catch (e) { /* skip a bad frame */ } finally { s.busy = false; }
-}
-let rec = null, recMsg = "", recTimer = null;
-function showRec() {
-  const s = rec ? rec.buffered_s : 0;
-  $("recInfo").textContent = (recMsg ? recMsg + " | " : "") + "buffered " + Math.floor(s / 60) + ":" +
-    String(s % 60).padStart(2, "0") + (rec && rec.last ? " | last saved on the drone computer: " + rec.last : "");
-  $("saveBtn").disabled = recMsg === "saving...";
-}
-$("saveBtn").onclick = () => {
-  if (!wsRef || wsRef.readyState !== 1) return;
-  wsRef.send(JSON.stringify({ type: "rec_save" }));
-  recMsg = "saving..."; showRec();
-  clearTimeout(recTimer);               // the drone should answer within a few seconds
-  recTimer = setTimeout(() => {
-    if (recMsg === "saving...") { recMsg = "no answer from the drone: is drone_client.py updated and running?"; showRec(); }
-  }, 6000);
-};
-
-setInterval(() => {
-  for (const [i, s] of Object.entries(rgbState)) {
-    const el = $("fps-" + i);
-    if (el) el.textContent = s.count + " fps";
-    s.count = 0;
-  }
-}, 1000);
-
-setInterval(() => {
-  const up = Date.now() - lastMsg < 3000;
-  $("status").textContent = up ? "live" : "offline";
-  $("status").className = up ? "up" : "";
-}, 1000);
-connect();
-</script>
-</body>
+  
 </html>

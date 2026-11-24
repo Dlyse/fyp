@@ -11,7 +11,7 @@ import json
 import os
 from urllib.parse import parse_qs
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 
 TOKEN = os.environ.get("DRONE_TOKEN", "change-me")                  # the drone's secret
@@ -65,6 +65,20 @@ async def login(request: Request):
                         secure=request.headers.get("x-forwarded-proto") == "https")
         return resp
     return HTMLResponse(LOGIN.replace("<!--msg-->", "<p>Wrong password</p>"), status_code=401)
+
+
+# ------------------------------------------------------------------ extra files the page loads
+STATIC = {"app.js": "text/javascript", "style.css": "text/css"}   # add a name here to serve another file
+
+
+@app.get("/{filename}")
+async def static_file(filename: str, request: Request):
+    path = os.path.join(HERE, filename)
+    if filename not in STATIC or not os.path.exists(path):
+        return Response(status_code=404)
+    if not _authed(request.cookies):              # same login as the page itself
+        return Response(status_code=401)
+    return FileResponse(path, media_type=STATIC[filename], headers={"Cache-Control": "no-store"})
 
 
 # ------------------------------------------------------------------ relay

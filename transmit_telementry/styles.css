@@ -1,0 +1,89 @@
+/* name | .name | #name || low | medium | high priority */
+
+body { 
+    font-family: system-ui, sans-serif; 
+    margin: 16px; 
+    background: #000000; 
+    color: #ffffff; 
+} 
+
+h1 {
+    font-size: 18px; 
+    margin: 0 0 12px; /* top 0 right left 0 bottom 12px */
+}
+
+#statusoff { 
+    padding: 3px 8px; 
+    border-radius: 10px; 
+    background: #a33; 
+    font-size: 13px; 
+}
+
+#status.up { /*higher priority, text using this class should inherits statusoff*/
+    background: #2a7; 
+}
+
+/*review tmr*/
+
+.grid {
+    display: grid;
+    grid-template-columns: 460px 1fr;   
+    grid-template-areas:
+        "cams   view3d"
+        "route  view3d"
+        ".      data";                   /* "." means an empty cell */
+    gap: 16px;
+}
+
+.a-cams  { grid-area: cams; }
+.a-route { grid-area: route; }
+.a-3d    { grid-area: view3d; }
+.a-data  { grid-area: data; }
+
+.card { 
+    background: #1c1c1c; 
+    border-radius: 8px; 
+    padding: 12px; 
+}
+
+img, canvas { 
+    width: 100%; 
+    background: #000; 
+    border-radius: 4px; 
+    image-rendering: pixelated; 
+}
+
+.cams { 
+    display: grid; 
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); 
+    gap: 8px; 
+}
+
+.cam div { 
+    font-size: 12px; 
+}   
+
+.cam canvas, .cam img { 
+    margin-bottom: 4px; 
+}
+
+canvas.rgb { 
+    image-rendering: auto; 
+}
+
+pre { 
+    margin: 0; 
+    font-size: 13px; 
+    white-space: pre-wrap; 
+}
+
+@media (max-width: 900px) {
+    .grid {
+        grid-template-columns: 1fr;
+        grid-template-areas:
+            "cams"
+            "view3d"
+            "data"
+            "route";
+    }
+}
