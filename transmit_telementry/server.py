@@ -68,7 +68,7 @@ async def login(request: Request):
 
 
 # ------------------------------------------------------------------ extra files the page loads
-STATIC = {"app.js": "text/javascript", "style.css": "text/css"}   # add a name here to serve another file
+STATIC = {"apps.js": "text/javascript", "styles.css": "text/css"}   # add a name here to serve another file
 
 
 @app.get("/{filename}")
