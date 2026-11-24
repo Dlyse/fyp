@@ -27,11 +27,21 @@ h1 {
 
 .grid {
     display: grid;
-    grid-template-columns: 460px 1fr;   
-    grid-template-areas:
-        "cams   view3d"
-        "route  view3d"
-        ".      data";                   /* "." means an empty cell */
+    grid-template-columns: 460px 1fr; 
+    grid-template-areas: "col-left col-right";   
+    gap: 16px;
+}
+
+
+.col-left {
+    display: grid;
+    grid-template-areas: "cams" "route";
+    gap: 16px;
+}
+
+.col-right {
+    display: grid;
+    grid-template-areas: "view3d" "data";
     gap: 16px;
 }
 
@@ -55,8 +65,8 @@ img, canvas {
 
 .cams { 
     display: grid; 
-    grid-template-columns: repeat(4, 1fr); 
-    grid-template-rows: repeat(2, 1fr); 
+    grid-template-columns: repeat(2, 1fr); 
+    grid-template-rows: repeat(4, 1fr); 
     gap: 8px; 
 }
 
@@ -88,6 +98,6 @@ pre {
             "route";
     }
     .cams {
-        grid-template-columns: repeat(1, 1fr);   /* 2 cols on small screens */
+        grid-template-columns: repeat(8, 1fr);   /* 2 cols on small screens */
     }
 }

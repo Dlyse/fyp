@@ -5,6 +5,8 @@
     <meta charset="utf-8">                                                <!-- makes special characters display correctly -->
     <meta name="viewport" content="width=device-width, initial-scale=1">  <!-- fix scaling on phones -->
     <link rel="stylesheet" href="styles.css">
+    <script src="apps.js"></script>
+
     <title>Title</title>
   </head>
 
@@ -14,19 +16,40 @@
     <p><button id="saveBtn">Save last 5 min</button> <small id="recInfo"></small></p>
 
     <div class="grid"> <!-- grid container [order doesnt matter]-->
-      <div class="card a-cams"><div>Depth cameras</div><div id="cams" class="cams"></div></div>
-      <div class="card a-route"><div>Route <small>(blue = planned, orange = flown)</small></div><canvas id="map" width="400" height="300"></canvas></div>
-      <div class="card a-data"><div>Telemetry</div><pre id="tel"></pre></div>
-      <div class="card a-3d">
-        <div>3D view <select id="sel3d"><option value="">off</option></select>
-        <small>(drag to rotate, wheel to zoom)</small></div>
-        <canvas id="c3d" width="800" height="450"></canvas>
+
+      <div class ="col-left">
+
+        <div class="card a-cams">
+          <div>Depth cameras</div>
+          <div id="cams" class="cams"></div>
+        </div>
+
+        <div class="card a-route">
+          <div>Route <small>(blue = planned, orange = flown)</small></div>
+          <canvas id="map" width="400" height="300"></canvas>
+        </div>
+
       </div>
+      
+      <div class ="col-right">
+
+        <div class="card a-3d">
+          <div>3D view
+            <select id="sel3d"><option value="">off</option></select>
+          <small>(drag to rotate, wheel to zoom)</small>
+          </div>
+          <canvas id="c3d" width="800" height="450"></canvas>
+        </div>
+
+        <div class="card a-data">
+          <div>Telemetry</div>
+          <pre id="tel"></pre>
+        </div>
+
+      </div>
+
     </div>
 
-    <script src="apps.js"></script>
   </body>
 
-
-  
 </html>
