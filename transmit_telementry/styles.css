@@ -27,8 +27,7 @@ h1 {
 
 .grid {
     display: grid;
-    grid-template-columns: 460px 1fr; 
-    grid-template-areas: "col-left col-right";   
+    grid-template-columns: minmax(300px, 460px) minmax(0, 1fr);
     gap: 16px;
 }
 
@@ -65,10 +64,13 @@ img, canvas {
 
 .cams { 
     display: grid; 
-    grid-template-columns: repeat(2, 1fr); 
-    grid-template-rows: repeat(4, 1fr); 
+    grid-template-columns: repeat(2, minmax(0, 1fr));   /* no fixed rows */ 
     gap: 8px; 
 }
+
+.cam img { display: none; }                              /* depth preview hidden by default */
+.cams.show-depth .cam img { display: block; }
+.cams.no-rgb .cam canvas.rgb { display: none; }
 
 .cam div { 
     font-size: 12px; 
@@ -88,16 +90,20 @@ pre {
     white-space: pre-wrap; 
 }
 
+#c3d {        /* never taller than 60% of the screen */
+    display: block;
+    width: min(100%, calc(60vh * 16 / 9));
+    margin: 0 auto;
+}
+
 @media (max-width: 900px) { /*if true*/
     .grid {
-        grid-template-columns: 1fr;
+        grid-template-columns: minmax(0, 1fr);
         grid-template-areas:
             "cams"
             "view3d"
             "data"
             "route";
     }
-    .cams {
-        grid-template-columns: repeat(8, 1fr);   /* 2 cols on small screens */
-    }
+    .col-left, .col-right { display: contents; }         /* cards become direct grid items */
 }

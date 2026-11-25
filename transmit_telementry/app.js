@@ -106,7 +106,7 @@ function drawMap() {
     g.fillStyle = "#FF7518"; g.beginPath(); g.arc(x, y, 6, 0, 7); g.fill();
     if (att) {
       const a = att.yaw * Math.PI / 180;
-      g.strokeStyle = "#fff"; g.lineWidth = 2; g.beginPath();
+      g.strokeStyle = "#FFFFFF"; g.lineWidth = 2; g.beginPath();
       g.moveTo(x, y); g.lineTo(x + 16 * Math.sin(a), y - 16 * Math.cos(a)); g.stroke();
     }
   }
@@ -114,7 +114,7 @@ function drawMap() {
     g.fillStyle = "#FF7518";
     g.fillText("Drone is " + Math.round(far / 1000) + " km from this route: check the simulator home location", 10, 16);
   }
-  g.fillStyle = "#888"; g.fillText("view about " + Math.round(span) + " m across, north is up", 10, c.height - 10);
+  g.fillStyle = "#888888"; g.fillText("view about " + Math.round(span) + " m across, north is up", 10, c.height - 10);
 }
 
 function sendView() {
@@ -123,6 +123,13 @@ function sendView() {
   wsRef.send(JSON.stringify({ type: "rgb", cam: wantRgb || null }));
 }
 $("sel3d").onchange = e => { want3d = e.target.value; clouds = {}; view.dist = want3d === "all" ? 9 : 5; sendView(); render(); };
+
+$("chkRgb").onchange = e => {
+  wantRgb = e.target.checked ? "all" : "";
+  $("cams").classList.toggle("no-rgb", !e.target.checked);
+  sendView();                      // "" is sent as null, so the drone stops streaming RGB
+};
+$("chkDepth").onchange = e => $("cams").classList.toggle("show-depth", e.target.checked);
 
 async function decode(bytes, type, w, h) {
   const bmp = await createImageBitmap(new Blob([bytes], { type }), { colorSpaceConversion: "none" });
@@ -188,7 +195,7 @@ function render() {
     }
   }
   g.putImageData(img, 0, 0);
-  if (merged) { g.fillStyle = "#fff"; g.fillRect(W / 2 - 3, H / 2 - 3, 6, 6); }   // the drone
+  if (merged) { g.fillStyle = "#FFFFFF"; g.fillRect(W / 2 - 3, H / 2 - 3, 6, 6); }   // the drone
 }
 let renderPending = false;
 function scheduleRender() {          // draw at most once per screen refresh, however many clouds arrive
