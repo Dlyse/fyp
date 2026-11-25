@@ -54,6 +54,10 @@ async def index(request: Request):
         return HTMLResponse(LOGIN)
     return FileResponse(os.path.join(HERE, "index.html"), headers={"Cache-Control": "no-store"})
 
+@app.head("/")
+async def health_check():
+    return Response(status_code=200)
+
 
 @app.post("/login")
 async def login(request: Request):
