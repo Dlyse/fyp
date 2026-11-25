@@ -1,5 +1,6 @@
 let route = [], pos = null, lastUrls = {}, lastMsg = 0;
 let camNames = [], meta3d = {}, want3d = "all", wantRgb = "all", wsRef = null, clouds = {};
+let mission = null, done = null, events = [], lastKey = "", lastMission = 0;    // NEW
 const $ = id => document.getElementById(id);
 
 function connect() {
@@ -30,6 +31,10 @@ function connect() {
       drawMap();
     } else if (m.type === "route") {
       route = m.points; drawMap();
+    } else if (m.type === "mission") {                                   // NEW
+      mission = m; lastMission = Date.now(); showMission();              // NEW
+    } else if (m.type === "mission_complete") {                          // NEW
+      done = m; showDone(); drawMap();                                   // NEW
     } else if (m.type === "rec_status") {
       clearTimeout(recTimer);
       recMsg = m.state === "saving" ? "saving..." : m.state === "error" ? "save failed: " + m.msg : "";
@@ -77,7 +82,8 @@ function drawMap() {
                          (cur.lon - wps[0].lon) * 111320 * Math.cos(wps[0].lat * Math.PI / 180));
     if (d > 5000) far = d;
   }
-  const all = wps.concat(far ? [] : trail, cur && !far ? [cur] : []);
+  const dpts = done && done.path ? done.path.map(p => ({ lat: p[0], lon: p[1] })) : []; 
+  const all = wps.concat(far ? [] : trail, far ? [] : dpts, cur && !far ? [cur] : []);       
   if (!all.length) { g.fillStyle = "#888"; g.fillText("No route or position yet", 20, c.height / 2); return; }
   const lat0 = all[0].lat, lon0 = all[0].lon, k = Math.cos(lat0 * Math.PI / 180);
   const xy = p => [(p.lon - lon0) * 111320 * k, -(p.lat - lat0) * 110540];
@@ -96,7 +102,19 @@ function drawMap() {
       g.fillStyle = "#FFFFFF"; g.fillText(String(i + 1), x + 7, y - 7);
     });
   }
-  if (trail.length > 1 && !far) {                             // where the drone has actually been
+  if (done && done.path && !far) {                    // NEW: the finished flight, green = out, purple = way home
+    g.lineWidth = 3;
+    for (let i = 1; i < done.path.length; i++) {
+      const a = pt({ lat: done.path[i - 1][0], lon: done.path[i - 1][1] });
+      const b = pt({ lat: done.path[i][0], lon: done.path[i][1] });
+      g.strokeStyle = done.path[i][3] ? "#C77DFF" : "#3DDC84";
+      g.beginPath(); g.moveTo(a[0], a[1]); g.lineTo(b[0], b[1]); g.stroke();
+    }
+    const last = done.path[done.path.length - 1], e = pt({ lat: last[0], lon: last[1] });
+    g.fillStyle = "#fff"; g.beginPath(); g.arc(e[0], e[1], 5, 0, 7); g.fill();
+    g.fillText({ arrived: "Destination reached", returned: "Returned to start", aborted: "Landed in place" }[done.outcome] || "", 10, 16);
+  }
+  if (trail.length > 1 && !far && !done) {                    
     g.strokeStyle = "#FF7518"; g.lineWidth = 1.5; g.beginPath();
     trail.forEach((p, i) => { const [x, y] = pt(p); i ? g.lineTo(x, y) : g.moveTo(x, y); });
     g.stroke();
@@ -267,4 +285,53 @@ setInterval(() => {
   $("status").textContent = up ? "live" : "offline";
   $("status").className = up ? "up" : "";
 }, 1000);
+
+const PHASES = {
+  preparing:   ["Preparing for takeoff", "idle"],
+  takeoff:     ["Taking off", "go"],
+  following:   ["Following the route", "go"],
+  avoiding:    ["Avoiding an obstacle", "avoid"],
+  recentering: ["Blocked: lining up to head home", "avoid"],
+  returning:   ["Returning to base", "ret"],
+  arrived:     ["Reached the final destination", "ok"],
+  returned:    ["Destination unapproachable: back at the start", "ret"],
+  aborted:     ["Blocked with no way round: landed in place", "bad"],
+};
+
+function showMission() {
+  const [label, cls] = PHASES[mission.phase] || [mission.phase, "idle"];
+  const wp = mission.wp && ["following", "avoiding", "returning"].includes(mission.phase) ? ` (waypoint ${mission.wp[0]}/${mission.wp[1]})` : "";
+  const extra = mission.avoiding && mission.phase !== "avoiding" ? " + avoiding obstacle" : "";
+  $("phase").textContent = label + wp + extra;
+  $("phaseDetail").textContent = mission.detail;
+  $("mission").className = "mission " + cls;
+  if (mission.phase === "preparing") { events = []; done = null; $("doneRow").hidden = true; lastKey = ""; }
+  const key = mission.phase + (mission.avoiding ? "+avoid" : "");
+  if (key !== lastKey) {                              // one line in the timeline per change
+    lastKey = key;
+    events.push(new Date().toLocaleTimeString() + "  " + label + extra + (mission.reason ? ` (${mission.reason})` : ""));
+    $("events").innerHTML = events.slice(-30).map(e => `<li>${e}</li>`).join("");
+  }
+}
+
+function showDone() {
+  $("doneRow").hidden = false;
+  $("doneInfo").textContent = `${done.distance_m} m flown in ${done.duration_s} s` +
+    (done.xte_max_m != null ? `, max ${done.xte_max_m} m off the line` : "") + " ";
+}
+$("dlRoute").onclick = () => {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(done, null, 2)], { type: "application/json" }));
+  a.download = "flown_route.json"; a.click();
+};
+$("dlPng").onclick = () => {                          // the map with a black background
+  const c = $("map"), o = document.createElement("canvas");
+  o.width = c.width; o.height = c.height;
+  const g = o.getContext("2d");
+  g.fillStyle = "#000"; g.fillRect(0, 0, o.width, o.height); g.drawImage(c, 0, 0);
+  const a = document.createElement("a");
+  a.href = o.toDataURL("image/png"); a.download = "flown_route.png"; a.click();
+};
+setInterval(() => $("mission").classList.toggle("stale", !!mission && Date.now() - lastMission > 8000), 1000);
+
 connect();

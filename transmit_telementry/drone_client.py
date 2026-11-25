@@ -49,6 +49,7 @@ JPEG_QUALITY = 60
 state: dict = {}           # latest telemetry, filled by the watcher tasks
 route: list = []           # [[lat, lon, alt], ...] downloaded from a PX4 mission
 route_override: list = []  # planned route published by your flight script on /dashboard/route
+mission_msgs: dict = {}    # latest /dashboard/mission message per type: {type: (json_text, time_received)}
 obstacle_info: dict = {}   # other code (your avoidance script) can write into this
 
 
@@ -396,6 +397,15 @@ def start_ros2():
             print("bad /dashboard/route message:", e)
 
     node.create_subscription(String, "/dashboard/route", on_route, 10)
+ 
+    def on_mission(msg):                                   
+        try:                                               
+            mission_msgs[json.loads(msg.data)["type"]] = (msg.data, time.time())  
+        except Exception as e:                             
+            print("bad /dashboard/mission message:", e)    
+
+    node.create_subscription(String, "/dashboard/mission", on_mission, 10)    
+
     threading.Thread(target=rclpy.spin, args=(node,), daemon=True).start()
 
 
@@ -526,12 +536,19 @@ async def refresh_route(drone):
 # ----------------------------------------------------------------- senders
 async def send_state(ws):
     n, last_route = 0, None
+    sent = {}                                                                  
     while True:
         await ws.send(json.dumps({"type": "telemetry", "t": time.time(), "avoidance": obstacle_info, **state}))
         current = route_override or route
         if current != last_route or n % int(TELEMETRY_HZ * 5) == 0:   # as soon as it changes, then every ~5 s
             await ws.send(json.dumps({"type": "route", "points": current}))
             last_route = list(current)
+        for typ, (text, got) in list(mission_msgs.items()):                   
+            prev, t_prev = sent.get(typ, (None, 0.0))                          
+            fresh = typ != "mission" or time.time() - got < 3.0                #nothing from a dead flight script
+            if fresh and (text != prev or (typ == "mission" and time.time() - t_prev > 2.0)):   
+                await ws.send(text)                                            
+                sent[typ] = (text, time.time())                               
         n += 1
         await asyncio.sleep(1 / TELEMETRY_HZ)
 

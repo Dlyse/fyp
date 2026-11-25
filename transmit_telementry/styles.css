@@ -93,6 +93,15 @@ pre {
     white-space: pre-wrap; 
 }
 
+.mission { padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; background: #333; }
+.mission.go    { background: #2563a8; }
+.mission.avoid { background: #c80; }
+.mission.ret   { background: #7b4fb3; }
+.mission.ok    { background: #2a7; }
+.mission.bad   { background: #a33; }
+.mission.stale { opacity: 0.5; }
+#events { margin: 6px 0 0; padding-left: 18px; font-size: 12px; max-height: 120px; overflow-y: auto; }
+
 #c3d {        /* never taller than 60% of the screen */
     display: block;
     width: min(100%, calc(60vh * 16 / 9));

@@ -40,7 +40,7 @@ def make_message(points):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--file", default="~/waypoint_follower.py", help="python file containing ROUTE")
+    ap.add_argument("--file", default="~/vs_code/fyp/routing/waypoint_follower.py", help="python file containing ROUTE")
     ap.add_argument("--topic", default="/dashboard/route")
     args = ap.parse_args()
 

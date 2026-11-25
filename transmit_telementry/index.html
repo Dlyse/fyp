@@ -11,6 +11,10 @@
   <body>
     <h1>Drone link <span id="status">offline</span></h1>
 
+    <div id="mission" class="mission idle">
+      <span id="phaseDetail"></span>
+    </div>
+
     <p><button id="saveBtn">Save last 5 min</button> <small id="recInfo"></small></p>
 
     <div class="grid"> <!-- grid container [order doesnt matter]-->
@@ -22,15 +26,20 @@
 
             <label><input type="checkbox" id="chkRgb" checked> RGB</label>
             <label><input type="checkbox" id="chkDepth"> depth preview</label>
-          
+
           </div>
-          
+
           <div id="cams" class="cams"></div>
         </div>
 
         <div class="card a-route">
-          <div>Route <small>(blue = planned, orange = flown)</small></div>
+          <div>Route <small>(blue = planned, orange = flown, green = completed, purple = way home)</small></div>
           <canvas id="map" width="400" height="300"></canvas>
+          <p id="doneRow" hidden>             
+            <small id="doneInfo"></small>
+            <button id="dlRoute">Download JSON</button> <button id="dlPng">Save map PNG</button>
+          </p>
+          <ol id="events"></ol> 
         </div>
 
       </div>
