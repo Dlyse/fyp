@@ -613,7 +613,7 @@ async def recv_loop(ws):
                 continue
             if m.get("type") == "view3d":
                 view3d = m.get("cam")
-                print("3D view:", view3d)
+                # print("3D view:", view3d)
             elif m.get("type") == "viewers":
                 viewers_n = int(m.get("n", 1))
             elif m.get("type") == "rec_save":
@@ -622,7 +622,7 @@ async def recv_loop(ws):
                 task.add_done_callback(bg_tasks.discard)
             elif m.get("type") == "rgb":
                 rgb_cam = m.get("cam")
-                print("RGB view:", rgb_cam)
+                # print("RGB view:", rgb_cam)
 
 
 async def run_link():

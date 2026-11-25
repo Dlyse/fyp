@@ -29,6 +29,7 @@ h1 {
     display: grid;
     grid-template-columns: minmax(300px, 460px) minmax(0, 1fr);
     gap: 16px;
+    align-items: start; 
 }
 
 
@@ -36,12 +37,14 @@ h1 {
     display: grid;
     grid-template-areas: "cams" "route";
     gap: 16px;
+    align-items: start; 
 }
 
 .col-right {
     display: grid;
     grid-template-areas: "view3d" "data";
     gap: 16px;
+    align-items: start; 
 }
 
 .a-cams  { grid-area: cams; }
