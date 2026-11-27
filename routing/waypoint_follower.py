@@ -1,138 +1,15 @@
 #!/usr/bin/env python3
 
-"""PX4 waypoint follower v7.0 (v6.4 + moving-obstacle robustness fixes, see "v7 changes" below): flies a route and goes around encountered obstacles using its cameras,
-including obstacles that MOVE.
-
-Route: spawn point, to a point ~40 m east.
-
-How avoidance works (all in the route frame: forward along the line, sideways = "lanes"):
-  * Each camera's clusterer publishes confirmed obstacle boxes in the drone body frame.
-    The follower merges the four lists and uses them for every decision below.
-
-  * Forward speed fades towards zero between slow_dist and stop_dist when something is in the
-    corridor ahead (half-width body_half_width); it counts as blocked at stop_dist + 0.5 m.
-    It must stay clear for clear_time before the drone moves on again, so flickering detections cannot make it creep forward.
-
-  * If it stays blocked for pause_time, it looks for a lane (a sideways offset from the
-    line, in steps of lane_step up to max_offset). A lane is only chosen if
-      - the sideways move to it is clear (including a pass_margin behind the drone),
-      - the camera on that side is running (unless allow_blind_dodge),
-      - the corridor ahead in that lane is clear for plan_dist.
-    The cheapest acceptable lane wins (small move, close to the line). If left and right are
-    about equally good (a real 50/50), left wins (see left_bias).
-
-  * Sideways moves are re-checked every tick and stop if something appears.
-
-  * Once the path ahead is clear it flies on in the new lane. It returns to the line only
-    when the sideways move back is clear AND the line is clear ahead, so it never cuts
-    back into the obstacle it is passing.
-
-  * Cross-track error is always measured against the ORIGINAL line.
-
-Moving obstacles (new in v6):
-  * Every box from the cameras is matched to the same thing seen a moment ago (a "track"). The track's recent
-    positions (in the world frame, so the drone's own movement does not count) give its speed. Faster than
-    mv_speed_on for a moment = a MOVING obstacle. (The camera clusterer must be able to follow fast things:
-    run it with a bigger -p track_gate, see the notes at the bottom of this docstring.)
-
-  * Moving obstacles are kept OUT of the normal obstacle memory. Memory assumes things stay where they were,
-    so a moving thing would leave a trail of fake obstacles behind it. Instead we predict where it will be for
-    the next mv_horizon seconds (with more spare room the further ahead we look) and test the drone's path
-    against that. Things that stand still use the memory exactly as before.
-
-  * Every tick it tries forward speeds of 100%, 75%, 50%, 25% and 0% and keeps the fastest one with no
-    predicted crash.
-      - 100% is fine: carry on.
-      - Only a slower speed is fine: slow down, or stop and let it pass.
-      - Even 0% (hovering) would get hit: DODGE NOW. It does not wait for pause_time. It slides to the cheapest
-        lane that stays clear of the prediction, at evade_lat_speed. A sideways move that becomes
-        unsafe is cancelled and planned again.
-
-  * A moving obstacle that keeps TURNING ROUND (swaying, circling, pacing) cannot be predicted in a straight
-    line: the prediction would change every time it turns and the drone would chase it from lane to lane. So once a
-    moving thing has been seen to turn round, everywhere it has been in the last mv_sway_window seconds becomes ONE
-    fixed no-go box, and the drone picks a lane beyond it. It only counts as standing still again after being
-    slow for mv_sway_calm seconds (a sway is slow for a moment at each end).
-
-  * WAIT AND LEARN. A moving obstacle that crosses the route sideways might be a one-off, or it might be
-    pacing up and down. The drone cannot tell which until it has seen the thing turn round, and it must never
-    start a detour (or a dash past) based on a guess about how far the thing travels. So for the first
-    mv_settle_time seconds after it first sees a sideways mover, and for as long as a thing keeps turning round,
-    the thing counts as a no-go STRIPE. An end of the stripe is only believed once the thing was seen to turn round
-    there; an end we have not seen is assumed to go on for mv_unknown_ext metres. The drone therefore holds back
-    and watches, and picks a lane once both ends are known (a lane beyond an end we HAVE seen also works).
-    If the ends are never seen (the thing goes out of camera range) it keeps waiting and, after give_up_time,
-    recentres and flies home like for any other blocked route.
-
-  * Found in real flight logs: (1) the sideways-move re-plan could flip between lanes 20 times a second, so a
-    re-plan now needs mv_replan_gap seconds between two changes, and the test for "is my goal lane still
-    bad?" uses the same rules as the test for choosing a lane (only the extra slack differs, so it has some
-    hysteresis); (2) with a moving obstacle swaying right in front of it and no lane to dodge into, the
-    drone just hovered 1 m from it until it gave up. Now, if even hovering would get hit and no lane is
-    safe, it BACKS AWAY along the route at mv_retreat_speed until hovering is safe again.
-
-  * Found in a third real flight log: the same sphere kept getting NEW track numbers about every second
-    (several at once), so it never had a history to work out its speed and sway from, and the standing-obstacle
-    code (which cannot tell it moves) dodged towards the direction the ball was heading. Now:
-      - boxes from all cameras seen at the same moment are merged when they touch (one thing seen from two
-        cameras is one thing), mv_fuse_gap;
-      - a moving thing that disappears for a moment is matched again when it shows up, even if it has moved
-        on by roughly its speed times the time it was gone;
-      - a thing that is new (younger than mv_probe_time) gets time to show whether it moves, before the
-        drone picks a detour around it as if it were standing still;
-      - every 5 s it logs how many boxes each camera gave, so you can see whether the cameras keep dropping it.
-
-  * A no-go zone that is entirely BEHIND the drone no longer blocks it from flying on: on the way home the
-    sphere is behind the drone, and the safety margin around the zone used to count as a crash even while
-    the drone was flying away from it (logs 1 and 2: it stood still until it gave up and landed in place).
-
-  * It keeps mv_brake_room of extra room in front of itself whenever it moves, so it can stop before the safety margin.
-    A detour lane only counts as safe if the drone can slide to it AND then carry on forward along it
-    (otherwise "stay where we are" always looked like the best lane in front of a fixed no-go zone).
-
-  * The cameras only see the near side of an object, so every moving obstacle's box is made mv_hidden_back bigger.
-
-  * Set mv_enabled:=false to switch all of this off (then it behaves like v4 + the left bias).
-
+"""
 v8 (dashboard): publishes what it is doing as JSON on /dashboard/mission (String): following the route, avoiding an
 obstacle, giving up and returning to base, and how the mission ended ("arrived", "returned" = destination unapproachable,
 "aborted" = landed in place). When it ends it also publishes the flown path as a "mission_complete" message and saves it to
 a JSON file (param flown_route_dir). drone_client.py forwards both to the dashboard.
 
-v7 changes (found by replaying the sphere flights; sparse detections ~1-2 per second, first sighting only 1-5 m away):
-  * Speed from SPARSE detections: the old fit needed 4 boxes within 0.8 s, which a 1-2 Hz detector almost never gives,
-    so a swaying sphere stayed "standing" for ~14 s (flight 3) and got new track numbers every second. Now the speed
-    window is mv_window (1.8 s), 3 boxes are enough, and 2 boxes >= 0.6 m apart also give a speed. Matching a box to a
-    track allows mv_search_speed * time-since-seen of movement, so a fast thing is still the same track after a gap.
-  * A track that moves ACROSS the route is remembered as a sway stripe for mv_sway_memory seconds, even after
-    mv_settle_time, and a new box that appears inside that stripe re-joins the old track (flight 3: after 12 s the stripe
-    was dropped, "Path ahead is clear" and the drone flew into the sphere at +4.5 m).
-  * STANDOFF: when something (standing, moving or a sway stripe) is closer than standoff / mv_standoff ahead, the drone
-    BACKS AWAY along the route (mv_retreat_speed) instead of hovering next to it, as long as the camera behind is
-    running and the way back is clear. The brake carrot no longer sits 0.5 m IN FRONT of the drone when something is
-    close (flight 3 hovered with the obstacle 0.3 m ahead and the carrot 0.5 m ahead of it).
-  * Ends of a sway stripe get mv_end_slack extra metres (sparse boxes miss the true turning point).
+trying to get moving obstacle dodging to be more robust
 
-Recovery (when blocked with no way around for give_up_time):
-  * RECENTER: slide sideways back to the route line at lat_speed.
+last version (v7) was able to sorta consistently dodge a singular sideways moving sphere, so this is my attempt at an evolution of that
 
-  * RTH: turn around, hold for 2s so the cameras refill in the new frame, then start flying home.
-    The return flight uses the same lane-dodging logic as the forward flight, so obstacles
-    on the way back are avoided the same. The waypoint list is built by reversing the original
-    route from the current leg backward, ending at home_pos.
-
-  * If RTH itself gets blocked with no way around for give_up_time, the drone lands in place.
-
-Notes:
-  * RTH assumes home is reachable via the reversed waypoints; for a single-leg route like
-    the default (spawn -> 40 m east) this is exactly the route line.
-
-  * Cross-track error is only accumulated during FLY, not during RTH, so the B-RID-style
-    numbers stay comparable to a nominal run.
-
-  * Moving obstacles need the clusterer to keep matching a fast thing from frame to frame. Its track_gate
-    (default 0.3 m) allows only about 2.4 m/s of closing speed at 8 Hz, and the closing speed includes
-    the drone's own 1.2 m/s. Run the clusterers with e.g.  -p track_gate:=0.8 -p process_hz:=10
 """
 
 import csv
@@ -182,9 +59,9 @@ PARAMS = {
     "use_gps": True,
 
     # --- for flying ---
-    "speed": 1.2,            # m/s along the line
-    "accel": 0.5,            # m/s^2
-    "decel": 1.7,            # m/s^2
+    "speed": 1.0,            # m/s along the line
+    "accel": 0.6,            # m/s^2
+    "decel": 1.6,            # m/s^2
     "accept_radius": 1.0,    # m
     "max_lead": 1.0,         # m, the carrot waits if the drone is further behind than this
     "land_at_end": True,
@@ -208,8 +85,8 @@ PARAMS = {
     "allow_blind_dodge": False, # True: sidestep even if that side's camera is not running
 
     # --- slowing down and stopping for obstacles ---
-    "slow_dist": 12.0,          # m, start slowing for an obstacle ahead
-    "stop_dist": 5.0,           # m, stop here
+    "slow_dist": 10.0,          # m, start slowing for an obstacle ahead
+    "stop_dist": 3.0,           # m, stop here
     "body_half_width": 1.5,     # m, corridor half-width (drone radius + margin)
     "height_band": 1.5,         # m, obstacles higher or lower than this are ignored
     "clear_time": 2.0,          # s, must stay clear this long before moving on
@@ -217,11 +94,11 @@ PARAMS = {
     "give_up_time": 30.0,       # s, blocked this long -> recenter, then return home (RTH)
     
     # --- going round obstacles (a 'lane' = a sideways offset from the route line) ---
-    "lane_step": 1.5,           # m between lanes
-    "max_offset": 7.5,          # m, furthest lane from the line (route corridor is ~5 m)
-    "lat_speed": 0.7,           # m/s sideways
+    "lane_step": 1,             # m between lanes
+    "max_offset": 10,           # m, furthest lane from the line (route corridor is ~5 m)
+    "lat_speed": 0.8,           # m/s sideways
     "pass_margin": 0.5,         # m, an obstacle must be this far behind before cutting back in
-    "min_pass": 15.0,           # m, after starting a dodge, do not cut back to the line until this far along the route
+    "min_pass": 10.0,           # m, after starting a dodge, do not cut back to the line until this far along the route
     "left_bias": 0.2,           # m, tiny discount for going left. Only decides when left and right are about equal (0 = off)
     
     # --- remembering obstacles that have left the cameras' view ---
@@ -250,9 +127,29 @@ PARAMS = {
     "mv_search_speed": 1.5,     # m/s, a thing not seen for a moment may have moved this fast: widens the matching gate
     "standoff": 2.0,            # m, never hover closer than this to a standing obstacle ahead: back away
     "mv_standoff": 2.0,         # m, same for a moving obstacle / sway stripe: gap between the drone and its predicted box
+    "vert_dz": 1.0,
+    "vert_memory": 30.0,
+    "vert_pad": 0.4,
     "mv_probe_hold": 15.0,      # s, a thing seen fewer than 3 times keeps blocking the way this long after it was last seen
     "mv_unconf_pad": 1.5,       # m, extra size (along the route) of the hold box around a thing not yet confirmed to stand still
+    "mv_retreat_lat": 3.0,      # m, an unconfirmed thing counts for the STANDOFF only if its real box is this close to the drone (straight line)
     "mv_probe_lat": 7.5,        # m, extra size SIDEWAYS of that hold box: an unconfirmed thing this far off the line may be about to cross it
+    "jerk": 2.5,                # m/s^3, comfort limit on how fast the acceleration of the forward speed may change
+    "decel_emergency": 2.5,     # m/s^2, braking limit in an emergency only (late detection, dodging); normal stops use decel
+    "jerk_emergency": 8.0,      # m/s^3, same, while dodging a moving obstacle or backing away from something too close
+    "speed_tau": 0.5,           # s, the speed command aims to reach its target in about this time (before the limits)
+    "carrot_slew": 1.5,         # m/s, how fast the brake carrot is pulled back to the drone when blocked
+    "standoff_retreat_speed": 0.6,  # m/s, speed of backing away from something closer than standoff (slower near the limit)
+    "standoff_release": 1.0,    # m, hysteresis: keep backing away until standoff + this, and hold still until there is room
+
+    ##############################################################################
+
+    "standoff_dwell": 0.4,      # s, g must stay below standoff this long before we hold still (debounce)
+    "standoff_exit": 0.3,       # s, g must stay above standoff+release this long before we move on
+
+    ##############################################################################
+    
+    "retreat_max": 6.0,         # m, never back away more than this in one go
     "mv_end_slack": 1.0,        # m, extra room at a sway stripe end that we have seen the thing turn round at
     "mv_replan_gap": 1.0,       # s, least time between two changes of the sideways move because of a moving obstacle
     "mv_settle_time": 12.0,     # s, a sideways mover is treated as a no-go stripe for this long after it is first seen
@@ -264,7 +161,7 @@ PARAMS = {
     "evade_lat_speed": 1.5,     # m/s, sideways speed when dodging a moving obstacle (lat_speed is slower)
 
     # --- lane planning and braking ---
-    "plan_dist": 14.0,          # m, a lane must be clear this far ahead
+    "plan_dist": 15.0,          # m, a lane must be clear this far ahead
     "brake_lead": 0.5,          # m, where the carrot stops relative to the drone when blocked
 }
 
@@ -427,7 +324,8 @@ class MTrack:
         self.moving = False
         self.bounded = False               # True once it has turned round
         self.cross = False                 # v7: True once it was seen moving ACROSS the route (set by the follower)
-
+        self.dormant_since = None          # v8: set when a bounded/cross track goes calm; keeps its stripe alive
+        self.dormant_env = None            # v8: (ctr, u, s_lo, s_hi, lo_k, hi_k) frozen at dormancy
 
 # Speed (north, east) from a straight line fitted through the recent positions.
 # One noisy box cannot fool it: it needs several positions spread over some time. None = not enough yet.
@@ -491,12 +389,22 @@ def _refresh_track(t, det, now, cfg):
         t.slow_t0 = None
     if not t.moving and t.n >= cfg["min_updates"] and t.fast >= 2:
         t.moving = True                    # fast for two checks in a row
+        t.dormant_since = None             # no longer dormant
+        t.dormant_env = None               # a fresh envelope will be built if it goes dormant again
     elif t.moving:
-        # a swaying thing is slow for a moment at each end of its sway, so it must stay slow for much longer
-        # before we believe it has really stopped
         calm = cfg["sway_calm"] if (t.bounded or t.cross) else cfg["calm"]
         if t.slow_t0 is not None and now - t.slow_t0 >= calm:
-            t.moving, t.fast, t.bounded, t.cross = False, 0, False, False
+            # go dormant, but DO NOT forget it was bounded/crossing: the stripe it swept stays no-go
+            t.moving = False
+            t.fast = 0
+            t.dormant_since = now
+            # FREEZE the swept envelope. Without this, track_extent() on a dormant track collapses to a
+            # point as the [now - mv_sway_window, now] window slides past the last sample, and the stripe
+            # stops being a no-go zone after mv_sway_window seconds instead of mv_sway_memory.
+            if t.bounded or t.cross:
+                t.dormant_env = track_extent(t, now, cfg.get("sway_window", 20.0))
+            else:
+                t.dormant_env = None
         else:
             if sp >= 0.4:
                 if not t.bounded and _turned_round(t, now):
@@ -745,7 +653,42 @@ class WaypointFollower(Node):
         self.lead_now = f("brake_lead")
         self.mv_end_slack = f("mv_end_slack")
         self.mv_probe_hold, self.mv_unconf_pad = f("mv_probe_hold"), f("mv_unconf_pad")
-        self.mv_probe_lat = f("mv_probe_lat")
+        self.mv_probe_lat, self.mv_retreat_lat = f("mv_probe_lat"), f("mv_retreat_lat")
+        self.vert_dz, self.vert_memory, self.vert_pad = f("vert_dz"), f("vert_memory"), f("vert_pad")
+        self.fprints = []
+        self.room_s0 = None
+        self.jerk, self.jerk_emergency, self.speed_tau = f("jerk"), f("jerk_emergency"), f("speed_tau")
+        self.carrot_slew, self.standoff_retreat_speed = f("carrot_slew"), f("standoff_retreat_speed")
+        self.standoff_release, self.retreat_max = f("standoff_release"), f("retreat_max")
+
+        ################################## testing #################################
+
+        self.standoff_dwell = f("standoff_dwell")
+        self.standoff_exit = f("standoff_exit")
+
+        ############################################################################
+        
+        self.decel_emergency = f("decel_emergency")
+        self.acc_cmd, self.jerk_now = 0.0, self.jerk
+        self.retreat_latched, self.retreat_s0 = False, None
+
+        ################################## testing #################################
+        
+        # v7.2: standoff is a HOLD, not a retreat, and it is debounced so it cannot chatter.
+        # Emergency retreat (negative forward speed) is reserved for Path A only (urgent + no lane).
+        self.standoff_t_enter = None    # when g first dropped below 'enter'
+        self.standoff_t_leave = None    # when g first rose above 'leave' (while latched)
+
+        # Committed lane for the current dodge, anchored to the route LINE (not to the drone).
+        # commit_lane is the signed line offset (right +) we are committed to reach/extend;
+        # commit_side is its sign, or 0 when not committed. Cleared only when back on the line.
+        self.commit_lane = 0.0
+        self.commit_side = 0.0
+        # set once when a dodge is first committed; used by the slide-path check and by standoff.
+        self.commit_t = -1e9
+        
+        ############################################################################
+        
         self.accel_now = self.accel
         self.det_log_t = 0.0
         self.det_buf = []                 # boxes from the cameras (world frame) waiting to be merged and tracked
@@ -758,7 +701,8 @@ class WaypointFollower(Node):
                            keep_moving=self.mv_memory_time + 0.5, keep_bounded=self.mv_sway_memory + 0.5, keep_static=3.0, keep_unconf=f("mv_probe_hold"), probe=f("mv_probe_time"),
                            search_speed=f("mv_search_speed"), sway_window=f("mv_sway_window"))
         self.mtracks = []       # everything the cameras have seen lately, see MTrack
-        self.evading = False    # True while sliding sideways out of a moving obstacle's way
+        self.evading_ids = set()   # track ids currently forcing an evade
+        self.evading = False       # convenience: bool(evading_ids), kept in sync each tick
         self.mv_seen = set()    # ids of moving obstacles already announced in the log
         self.mv_swaying = set() # ids of obstacles already announced as 'keeps turning round'
         # the allowed lanes (sideways offsets from the line): 0, then 1 step right, 1 step left,
@@ -796,6 +740,7 @@ class WaypointFollower(Node):
         self.seg_start = None
         self.carrot_s = 0.0
         self.v = 0.0
+        self.acc_cmd = 0.0
         self.fly_t0 = None
         self.off_cmd = 0.0      # sideways offset being commanded (right +)
         self.off_goal = 0.0
@@ -853,7 +798,10 @@ class WaypointFollower(Node):
             self.cb[cam] = self._make_box_cb(cam)
             self.create_subscription(Float32MultiArray, cfg[f"{cam}_topic"], self.cb[cam], 10)
         # run on_timer() rate_hz times a second: this is the main loop
+        self._tick_durs = []
+        self._tick_t0 = None
         self.create_timer(1.0 / self.rate_hz, self.on_timer)
+
         self.get_logger().info(
             f"{len(wp)} waypoints, speed {self.speed} m/s. Obstacle boxes from {[cfg[c + '_topic'] for c in CAMS]}")
 
@@ -973,6 +921,32 @@ class WaypointFollower(Node):
                     f"Widen max_offset, reduce pass_margin, or increase plan_dist.")
         return ("Every lane within max_offset is blocked ahead or beside it. Try a larger -p max_offset "
                 "(your route corridor is about 5 m) or a lower -p pass_margin.")
+
+    def _same_side_lanes(self, side):
+        """Lanes on `side` (+1 right / -1 left) that are at least as far out as the committed lane.
+        Anchored to the route line, not to the drone's current `cross`."""
+        if side == 0.0:
+            return list(self.lanes)
+        commit = abs(self.commit_lane) if self.commit_side == side else 0.0
+        return [l for l in self.lanes
+                if l == 0.0
+                or (l * side > 0 and abs(l) >= commit - 1e-6)
+                or (l * side < 0 and abs(l) > commit + self.lane_step)]
+
+    def _slide_path_clear(self, boxes, cross, off_from, off_to, hw, zh, look_back=None):
+        """Is the sideways strip from line-offset off_from to off_to clear, measured from the DRONE's
+        actual line offset `cross` (so it stays valid when the drone lags the carrot)? All offsets are
+        signed line offsets, right +. Returns the first hit x (inf = clear)."""
+        lo, hi = sorted((off_from, off_to))
+        # the drone must traverse from cross to off_to, plus optionally peek behind the drone
+        back = self.pass_margin if look_back is None else look_back
+        # in body frame: right = -y, so a line offset L sits at y = -L
+        y0 = -hi - hw
+        y1 = -lo + hw
+        # include the drone's own position so we never command a slide through something we are inside
+        y0 = min(y0, -cross - hw)
+        y1 = max(y1, -cross + hw)
+        return first_hit_x(boxes, -back, hw, y0, y1, zh)
     
     def _remember(self, now, live, s_drone, cross, excl=()):
         """Merge what the cameras see into a memory kept in ROUTE coordinates (s along the route, l to the left,
@@ -983,13 +957,27 @@ class WaypointFollower(Node):
             return live
         # where the drone is in route coordinates: l_d = sideways (left +), alt = height above the start
         l_d, alt = -cross, -float(self.pos[2])
+
         # 1) Add what the cameras see now: convert each box to route coordinates, merge it with any
         # remembered box it overlaps, and stamp it with the current time.
+        
+        # v7.4: clip each box to the drone's altitude band BEFORE the union. Without this, a thing
+        # that moves vertically (a sphere bobbing up and down) is seen at many different heights,
+        # and box_union grows its remembered box to span the whole sweep. That remembered box then
+        # intersects our altitude band forever (memory_time), so we dodge a standing obstacle that
+        # is not actually standing in the way. Only the part of the box that was in our band when
+        # we saw it is worth remembering.
+        alt_lo = alt - self.zh
+        alt_hi = alt + self.zh
         for b in live:
             rb = (b[0] + s_drone, b[1] + l_d, b[2] + alt, b[3] + s_drone, b[4] + l_d, b[5] + alt)
+            rb = (rb[0], rb[1], max(rb[2], alt_lo), rb[3], rb[4], min(rb[5], alt_hi))
+            if rb[5] <= rb[2]:
+                continue                    # the box never entered our altitude band: nothing to remember
             hits = [m for m in self.mem if box_overlap(m[0], rb)]
             self.mem = [m for m in self.mem if m not in hits]
-            self.mem.append((box_union([rb] + [m[0] for m in hits]), now))   # grows as more of it is seen
+            self.mem.append((box_union([rb] + [m[0] for m in hits]), now))
+
         # 2) Throw away memories that are too old, too far behind, or contradicted by a camera.
         # (facings = the directions of the cameras that are running)
         facings = [FACING[c] for c in CAMS if self._alive(c, now)]
@@ -999,14 +987,30 @@ class WaypointFollower(Node):
             rel = (box[0] - s_drone, box[1] - l_d, box[2] - alt, box[3] - s_drone, box[4] - l_d, box[5] - alt)
             if excl and self._inside_any(rel, excl):
                 continue                                    # a moving thing was here: it is not a standing obstacle
+
             if now - t > self.memory_time or rel[3] < -30.0:
                 continue                                    # too old, or far behind us
+            # v7.4: drop remembered boxes that no longer overlap our altitude band. The stored box
+            # was already clipped to the band when it was written, so any box reaching here still
+            # overlapping the band is still relevant; one that has fallen outside (only possible if
+            # the band itself moved) is not.
+            if rel[5] <= -self.zh or rel[2] >= self.zh:
+                continue
             if now - t > self.contradict_time:              # a camera can see the nearest part of it, and nothing is there
                 nx, ny = min(max(0.0, rel[0]), rel[3]), min(max(0.0, rel[1]), rel[4])
                 if in_view((nx, ny, 0.0, nx, ny, 0.0), facings, self.fov_half, self.view_range):
                     continue
+                
             keep.append((box, t))
+            
         self.mem = keep
+
+        if self.mem:
+            self._log_every(now, 5.0,
+                f"Memory: {len(self.mem)} box(es); nearest z-span "
+                f"[{min(m[0][2] for m in self.mem):.1f}, {max(m[0][5] for m in self.mem):.1f}] m "
+                f"(our band ±{self.zh:.1f} m around {alt:.1f})")
+
         # give back the live boxes + the remembered ones, all relative to the drone again
         return live + [(b[0] - s_drone, b[1] - l_d, b[2] - alt, b[3] - s_drone, b[4] - l_d, b[5] - alt)
                        for b, t in self.mem]
@@ -1050,6 +1054,8 @@ class WaypointFollower(Node):
     # Merge the boxes that arrived since the last tick (all cameras), match them to tracks and work out speeds.
     def _track_update(self, now):
         dets, self.det_buf = fuse_dets(self.det_buf, self.mv_fuse_gap), []
+        for d in dets:
+            self._fp_update(d, now)
         before = {t.id for t in self.mtracks if t.moving}
         if dets:
             update_mtracks(self.mtracks, dets, now, self.mv_cfg)
@@ -1076,13 +1082,102 @@ class WaypointFollower(Node):
     # v7: seen, but not yet confirmed to stand still: fewer than 3 sightings, or younger than mv_probe_time. Such a thing may
     # be a sweeping obstacle that is only seen once per sweep, so no detour is planned around it, and it keeps blocking
     # the way (as an inflated hold box) for mv_probe_hold seconds after it was last seen (3 s once it has 3 sightings).
+    def _fp_update(self, d, now):
+        zc = (d[2] + d[5]) / 2
+        best, bd = None, 1e9
+        for r in self.fprints:
+            b = r["box"]
+            gap = math.hypot(max(b[0] - d[3], 0.0, d[0] - b[2]), max(b[1] - d[4], 0.0, d[1] - b[3]))
+            if gap < 0.5 and gap < bd:
+                best, bd = r, gap
+        if best is None:
+            best = dict(box=[d[0], d[1], d[3], d[4]], zs=deque(maxlen=60), last=now, vert=False)
+            self.fprints.append(best)
+        else:
+            b = best["box"]
+            nb = [min(b[0], d[0]), min(b[1], d[1]), max(b[2], d[3]), max(b[3], d[4])]
+            if max(nb[2] - nb[0], nb[3] - nb[1]) <= 3.0:
+                best["box"] = nb
+        best["zs"].append((now, zc))
+        best["last"] = now
+        z = [x[1] for x in best["zs"] if now - x[0] <= 25.0]
+        if len(z) >= 3 and max(z) - min(z) >= self.vert_dz:
+            best["vert"] = True
+        self.fprints = [r for r in self.fprints if now - r["last"] <= self.vert_memory + 5.0]
+
+    def _in_pillar(self, c, now):
+        for r in self.fprints:
+            if r["vert"] and now - r["last"] <= self.vert_memory:
+                b = r["box"]
+                if b[0] - 0.5 <= c[0] <= b[2] + 0.5 and b[1] - 0.5 <= c[1] <= b[3] + 0.5:
+                    return True
+        return False
+
+    def _pillar_boxes(self, now):
+        if self.pos is None:
+            return []
+        c, s = math.cos(self.hold_yaw), math.sin(self.hold_yaw)
+        out = []
+        for r in self.fprints:
+            if not r["vert"] or now - r["last"] > self.vert_memory:
+                continue
+            b = r["box"]
+            hn, he = (b[2] - b[0]) / 2 + self.vert_pad, (b[3] - b[1]) / 2 + self.vert_pad
+            dn, de = (b[0] + b[2]) / 2 - self.pos[0], (b[1] + b[3]) / 2 - self.pos[1]
+            x, y = dn * c + de * s, dn * s - de * c
+            hx = abs(c) * hn + abs(s) * he
+            hy = abs(s) * hn + abs(c) * he
+            if x + hx < -30.0:
+                continue
+            out.append((x - hx, y - hy, -2 * self.zh, x + hx, y + hy, 2 * self.zh))
+        return out
+
     def _unconfirmed(self, t, now):
+        if self._in_pillar(t.c, now):
+            return False
         return (not t.moving) and (t.n < 3 or now - t.born < self.mv_probe) and \
                now - t.seen < (self.mv_probe_hold if t.n < 3 else 3.0)
 
-    # Is there a newly seen thing that has not yet shown whether it moves?
     def _probing(self, now):
-        return any(self._unconfirmed(t, now) for t in self.mtracks)
+        """True only if an unconfirmed track is actually a threat ahead: within plan_dist along the corridor
+        and within reach sideways. A new thing 20 m off to the side must not stall planning."""
+        if self.pos is None:
+            return False
+        c, s = math.cos(self.hold_yaw), math.sin(self.hold_yaw)
+        alt = -float(self.pos[2])
+        for t in self.mtracks:
+            if not self._unconfirmed(t, now):
+                continue
+            if t.z1 - alt < -self.zh or t.z0 - alt > self.zh:
+                continue
+            dn, de = t.c[0] - self.pos[0], t.c[1] - self.pos[1]
+            x, y = dn * c + de * s, dn * s - de * c
+            hx = abs(c) * t.half[0] + abs(s) * t.half[1]
+            hy = abs(s) * t.half[0] + abs(c) * t.half[1]
+            if x - hx <= self.plan_dist and x + hx >= -1.0 and abs(y) - hy <= self.hw + self.mv_margin + 0.5:
+                return True
+        return False
+
+    # Distance to the REAL near face (no padding along the route) of the nearest not-yet-confirmed thing that is within
+    # sideways reach of our line. Used for the standoff, so a thing seen late and close counts, but a padded box does not.
+    def _hold_gap(self, now):
+        if self.pos is None:
+            return math.inf
+        c, s = math.cos(self.hold_yaw), math.sin(self.hold_yaw)
+        alt = -float(self.pos[2])
+        g = math.inf
+        for t in self.mtracks:
+            if not self._unconfirmed(t, now) or t.z1 - alt < -self.zh or t.z0 - alt > self.zh:
+                continue
+            dn, de = t.c[0] - self.pos[0], t.c[1] - self.pos[1]
+            x, y = dn * c + de * s, dn * s - de * c
+            hx = abs(c) * t.half[0] + abs(s) * t.half[1]
+            hy = abs(s) * t.half[0] + abs(c) * t.half[1]
+            # a threat for the standoff only if it is really CLOSE (straight-line distance to its real box), so we never back
+            # away from something far off to the side that we then cannot see again to confirm
+            if x + hx > 0.3 and math.hypot(max(0.0, x - hx), max(0.0, abs(y) - hy - 0.4)) < self.mv_retreat_lat:
+                g = min(g, max(0.0, x - hx))
+        return g
 
     # Hold boxes (route frame, relative to the drone) for the things that are not yet confirmed to stand still.
     def _hold_boxes(self, now):
@@ -1101,6 +1196,38 @@ class WaypointFollower(Node):
             out.append((x - hx, y - hy, t.z0 - alt, x + hx, y + hy, t.z1 - alt))
         return out
 
+    def _single_pred(self, t, now, c, s, alt):
+        """Build the single pred tuple for track t exactly as _movers would, or None if it is out of scope."""
+        age = now - t.seen
+        if not t.moving:
+            return None
+        hn, he = t.half[0] + self.mv_hidden, t.half[1] + self.mv_hidden
+        rel = lambda n, e: ((n - self.pos[0]) * c + (e - self.pos[1]) * s,
+                            (n - self.pos[0]) * s - (e - self.pos[1]) * c)
+        if t.bounded or t.cross:
+            if age > self.mv_sway_memory:
+                return None
+            ctr, u, s_lo, s_hi, lo_k, hi_k = track_extent(t, now, self.mv_sway_window)
+            w = max(hn, he)
+            perp = np.array([-u[1], u[0]])
+            def box(a, b):
+                pts = [rel(*(ctr + u * sa + perp * sw)) for sa in (a, b) for sw in (-w, w)]
+                xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+                return min(xs), min(ys), max(xs), max(ys)
+            sl = self.mv_end_slack
+            x0, y0, x1, y1 = box(s_lo - sl if lo_k else s_lo - self.mv_unknown_ext,
+                                 s_hi + sl if hi_k else s_hi + self.mv_unknown_ext)
+            return ((x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2, (y1 - y0) / 2,
+                    t.z0 - alt, t.z1 - alt, 0.0, 0.0, self.mv_margin, 0.0)
+        if age > self.mv_memory_time:
+            return None
+        hx = abs(c) * hn + abs(s) * he
+        hy = abs(s) * hn + abs(c) * he
+        x, y = rel(t.c[0] + t.v[0] * age, t.c[1] + t.v[1] * age)
+        vx, vy = t.v[0] * c + t.v[1] * s, t.v[0] * s - t.v[1] * c
+        return (x, y, hx, hy, t.z0 - alt, t.z1 - alt, vx, vy,
+                self.mv_margin + self.mv_growth * age, self.mv_growth)
+
     # Moving obstacles as predictions in the route frame, relative to the drone (x forward, y left).
     # preds = (cx, cy, half_x, half_y, z_lo, z_hi, vx, vy, extra_room, growth), one per moving obstacle.
     #   - a thing on a straight run (or heading towards us): its box is carried forward at its speed
@@ -1114,13 +1241,47 @@ class WaypointFollower(Node):
             return [], []
         c, s = math.cos(self.hold_yaw), math.sin(self.hold_yaw)
         alt = -float(self.pos[2])
-        self.mtracks = [t for t in self.mtracks if now - t.seen <= (
-            self.mv_sway_memory + 0.5 if t.moving and (t.bounded or t.cross or now - t.born < self.mv_settle) else
-            self.mv_memory_time + 0.5 if t.moving else self.mv_probe_hold if t.n < 3 else 3.0)]
+        def _keep(t):
+            if t.moving:
+                if t.bounded or t.cross or now - t.born < self.mv_settle:
+                    return now - t.seen <= self.mv_sway_memory + 0.5
+                return now - t.seen <= self.mv_memory_time + 0.5
+            if (t.bounded or t.cross) and t.dormant_since is not None:
+                return now - t.dormant_since <= self.mv_sway_memory
+            if t.n < 3:
+                return now - t.seen <= self.mv_probe_hold
+            return now - t.seen <= 3.0
+        self.mtracks = [t for t in self.mtracks if _keep(t)]
         rel = lambda n, e: ((n - self.pos[0]) * c + (e - self.pos[1]) * s, (n - self.pos[0]) * s - (e - self.pos[1]) * c)
         preds, excl = [], []
         for t in self.mtracks:
             age = now - t.seen
+
+            if (not t.moving) and (t.bounded or t.cross) and t.dormant_since is not None:
+                # dormant stripe: emit the frozen no-go box exactly like a bounded track, growth=0
+                age = now - t.dormant_since
+                if age > self.mv_sway_memory:
+                    continue
+                if t.dormant_env is not None:
+                    ctr, u, s_lo, s_hi, lo_k, hi_k = t.dormant_env
+                else:
+                    ctr, u, s_lo, s_hi, lo_k, hi_k = track_extent(t, now, self.mv_sway_window)
+                hn, he = t.half[0] + self.mv_hidden, t.half[1] + self.mv_hidden
+                w = max(hn, he)
+                perp = np.array([-u[1], u[0]])
+                def _box(a, b):
+                    pts = [rel(*(ctr + u * sa + perp * sw)) for sa in (a, b) for sw in (-w, w)]
+                    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+                    return min(xs), min(ys), max(xs), max(ys)
+                sl = self.mv_end_slack
+                x0, y0, x1, y1 = _box(s_lo - sl if lo_k else s_lo - self.mv_unknown_ext,
+                                      s_hi + sl if hi_k else s_hi + self.mv_unknown_ext)
+                preds.append(((x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2, (y1 - y0) / 2,
+                              t.z0 - alt, t.z1 - alt, 0.0, 0.0, self.mv_margin, 0.0))
+                ox0, oy0, ox1, oy1 = _box(s_lo, s_hi)
+                excl.append((ox0 - 0.5, oy0 - 0.5, ox1 + 0.5, oy1 + 0.5))
+                continue
+            
             if not t.moving:
                 continue
             # half size, plus a little extra: the cameras only see the near side, so the far side may stick out
@@ -1173,11 +1334,28 @@ class WaypointFollower(Node):
         cx, cy = (b[0] + b[3]) / 2, (b[1] + b[4]) / 2
         return any(e[0] <= cx <= e[2] and e[1] <= cy <= e[3] for e in excl)
 
+    def _step_speed(self, target, dt):
+        """Move the forward speed self.v towards target with limited acceleration AND limited jerk."""
+        dv = target - self.v
+        dec = self.decel_emergency if self.jerk_now >= self.jerk_emergency else self.decel
+        a_des = max(-dec, min(self.accel_now, dv / max(self.speed_tau, 1e-3)))
+        da = self.jerk_now * dt
+        self.acc_cmd += max(-da, min(da, a_des - self.acc_cmd))
+        v_new = self.v + self.acc_cmd * dt
+        if (self.v - target) * (v_new - target) < 0.0 and abs(v_new - target) < 0.15:   # arrived: do not ring around the target
+            v_new, self.acc_cmd = target, 0.0
+        self.v = v_new
+
     def _avoid(self, now, dt, cross, s_drone):
         """Decide forward speed (0..1) and update the sideways offset. Returns (scale, land)."""
         self.fx = math.inf
         # no front camera data: either stand still (safe) or fly on blind, depending on require_front
         if not self._alive("front", now):
+            # drain det_buf: the other cameras keep feeding it, but nothing will match these boxes while we
+            # are not planning. If we let it grow, a burst of stale boxes floods _track_update when the front
+            # camera recovers, producing a giant fused blob and a bogus track.
+            if self.mv_on:
+                self.det_buf = []
             if self.require_front:
                 self._log_every(now, 5.0, "No front obstacle data: holding. (Start the front clusterer, "
                                           "or run with -p require_front:=false)")
@@ -1200,7 +1378,19 @@ class WaypointFollower(Node):
         else:
             boxes = self._remember(now, live, s_drone, cross, excl)
         if self.mv_on:
+            boxes = boxes + self._pillar_boxes(now)
+        core_boxes = boxes          # real things only (standing boxes + memory); the hold boxes below only stop us
+
+        if self.mv_on:
             boxes = boxes + self._hold_boxes(now)
+
+        if self.mv_on and self.evading_ids:
+            alive = {t.id: t for t in self.mtracks if t.moving}
+            self.evading_ids = {
+                tid for tid in self.evading_ids
+                if tid in alive and (now - alive[tid].seen <= self.mv_memory_time)
+            }
+            self.evading = bool(self.evading_ids)
 
         hw, zh = self.hw, self.zh
         # fx = distance to the nearest obstacle in the corridor ahead (half-width hw, only things near our height)
@@ -1209,22 +1399,59 @@ class WaypointFollower(Node):
         # MOVING OBSTACLES. mv_scale = the fastest forward speed (0..1) with no predicted crash,
         # urgent = even standing still would get hit, so dodge right now.
         lat_v = self.evade_lat_speed if self.evading else self.lat_speed
-        mv_scale, urgent, lane_free = 1.0, False, None
+        mv_scale, urgent, lane_free, near_preds, v_after = 1.0, False, None, [], None
         if preds:
-            # the drone is at y = 0 in this frame; the lane we are heading for is (cross - off_goal) to the left
-            mv_scale, urgent = plan_vs_movers(preds, cross - self.off_goal, self.speed, lat_v, self.mv_hw, zh, self.mv_horizon, self.mv_brake)
+            # rank preds by time-to-conflict against the CURRENT commanded lane (so the near threat wins)
+            def t_conf(p):
+                return first_conflict([p], cross - self.off_goal, self.speed, lat_v,
+                                      self.mv_hw, zh, self.mv_horizon)
+            keyed = [(t_conf(p), p) for p in preds]           # one call per pred
+            keyed = [(t if t is not None else math.inf, p) for t, p in keyed]
+            keyed.sort(key=lambda x: x[0])
+            t_near = keyed[0][0] if keyed and keyed[0][0] < math.inf else None
+            near_preds = [keyed[0][1]] if t_near is not None else []
+            
+            # far-horizon window for validating lanes: only up to when the near threat would have hit anyway
+            far_horizon = self.mv_horizon if t_near is None else min(self.mv_horizon, t_near + 1.0)
+            mv_scale, urgent = plan_vs_movers(preds, cross - self.off_goal, self.speed, lat_v,
+                                              self.mv_hw, zh, self.mv_horizon, self.mv_brake)
             if urgent:
-                self.evading = True
+                # record WHICH tracks are urgent, so we do not clear the evade flag while a different mover is still on us
+                for t in self.mtracks:
+                    if not t.moving:
+                        continue
+                    p = self._single_pred(t, now, math.cos(self.hold_yaw), math.sin(self.hold_yaw),
+                                          -float(self.pos[2]))
+                    if p is None:
+                        continue
+                    if first_conflict([p], cross - self.off_goal, 0.0, lat_v, self.mv_hw, zh,
+                                      self.mv_horizon) is None:
+                        continue
+                    self.evading_ids.add(t.id)
+                self.evading = bool(self.evading_ids)
                 lat_v = self.evade_lat_speed
                 self._log_every(now, 2.0, "Moving obstacle will hit us even if we stop: dodging now.")
             elif mv_scale < 1.0:
                 self._log_every(now, 2.0, f"Moving obstacle: slowing down to {mv_scale:.0%}.")
-            # is it safe to slide to lane L (right +) and stay there?
-            # Is lane L (right +) safe? Slide there (without moving forward), and unless we must dodge RIGHT NOW,
-            # also check that we can then carry on forward along it.
             v_after = None if urgent else self.speed
-            lane_free = lambda L: first_conflict(preds, cross - L, 0.0, lat_v, self.mv_hw, zh, self.mv_horizon,
-                                                 v_after=v_after, slack=0.3, soft_slide=True) is None
+
+            def lane_free(L):
+                # 1) must be clear of the NEAR threat over the full horizon (this is the one that decides).
+                # near_preds can be empty even when preds is not: a mover present but not on a collision
+                # course with the CURRENT lane produces t_near = None. In that case skip to (2).
+                if near_preds and first_conflict(near_preds, cross - L, 0.0, lat_v, self.mv_hw, zh,
+                                                 self.mv_horizon, v_after=v_after,
+                                                 slack=0.3, soft_slide=True) is not None:
+                    return False
+                # 2) must be clear of everything else over the (shorter) far window.
+                # If there is no near threat, "everything else" is the whole pred list.
+                rest = [p for p in preds if (not near_preds) or p is not near_preds[0]]
+                if rest and first_conflict(rest, cross - L, 0.0, lat_v, self.mv_hw, zh,
+                                           far_horizon, v_after=v_after,
+                                           slack=0.3, soft_slide=True) is not None:
+                    return False
+                return True
+
             # standing still for a moving obstacle counts as blocked (so the give-up timer and lane search apply)
             if mv_scale == 0.0 or urgent:
                 self.last_blocked_t = now
@@ -1247,6 +1474,19 @@ class WaypointFollower(Node):
         moving = abs(self.off_goal - self.off_cmd) > 1e-3
         side_ok = self._side_ok(now)
 
+        if blocked or self.off_goal != 0.0 or self.evading_ids:
+            live_n = len(live)
+            mem_n = len(self.mem)
+            hold_n = len(boxes) - len(core_boxes)
+            sx = first_hit_x(core_boxes, 0.3, self.slow_dist, -hw, hw, zh)
+            sx_l = first_hit_x(core_boxes, 0.3, self.plan_dist, -1.5 - hw, -1.5 + hw, zh)   # left lane
+            sx_r = first_hit_x(core_boxes, 0.3, self.plan_dist, +1.5 - hw, +1.5 + hw, zh)   # right lane
+            self._log_every(now, 1.0,
+                f"AVOID st={self.state} blk={blocked} off={self.off_cmd:+.1f}->{self.off_goal:+.1f} "
+                f"fx={fx:.1f} sx={sx:.1f} L={sx_l:.1f} R={sx_r:.1f} "
+                f"live={live_n} mem={mem_n} hold={hold_n} preds={len(preds)} "
+                f"ev={sorted(self.evading_ids)} urg={urgent} gap={math.isfinite(first_hit_x(core_boxes, -3.0, -0.2, -hw, hw, zh))}")
+
         # Stuck for too long (give_up_time): give up. The first time -> recenter, then go home.
         # (The RECENTER check inside only applies if state is RECENTER, but this function is only called in FLY and RTH.)
         if blocked and now - self.block_t0 > self.give_up_time:
@@ -1258,52 +1498,69 @@ class WaypointFollower(Node):
 
         # Not sliding sideways right now, so we may decide on a new sideways move.
         no_lane = False
+        need_room = False
         if not moving:
             # CASE 1: blocked for pause_time -> look for a lane to go round the obstacle
             # (a thing that is still new gets mv_probe_time seconds to show whether it moves, before we detour around it)
             if blocked and (urgent or (now - self.block_t0 > self.pause_time and not (self.mv_on and self._probing(now)))):
                 lanes = self.lanes
-                # already going round something on one side: only allow lanes further out on that side
-                # (or a small step back), or a big jump to the other side. This stops it wobbling back and forth.
-                # (Not when a moving obstacle is about to hit us: then every lane is allowed.)
+                # ---- v7.3: a committed dodge side must be escapable. ----
+                # If we are already at (or past) max offset on the dodge side and still urgent, the
+                # "only further out on that side" filter starves the lane list (it returns only {0}),
+                # no_lane becomes True every tick, and Path A retreats forever while the mover is
+                # crossing sideways. Instead: try same-side lanes first; if that yields nothing while
+                # urgent, abandon the side and consider ALL lanes.
+                sides = []
                 if self.dodge_side and not urgent:
-                    cur_abs = abs(cross)
-                    side = self.dodge_side
-                    lanes = [l for l in self.lanes
-                             if l == 0.0
-                             or (l * side > 0 and abs(l) > cur_abs - 0.5)        # further out (or small retreat)
-                             or (l * side < 0 and abs(l) > cur_abs + self.lane_step)]  # jump over to the other side
+                    sides.append(self._same_side_lanes(self.dodge_side))
+                sides.append(self.lanes)                      # unconditional fallback (never starves)
+                # dedupe identical lists (cheap; avoids re-running choose_lane twice on the same set)
+                uniq, seen = [], set()
+                for L in sides:
+                    key = tuple(L)
+                    if key not in seen:
+                        seen.add(key)
+                        uniq.append(L)
+                sides = uniq
 
-                # pick the cheapest safe lane (None = no lane is safe)
-                lane = choose_lane(boxes, cross, lanes, hw, zh, self.plan_dist, self.pass_margin, side_ok, self.left_bias, lane_free)
-                # about to be hit and no lane is completely clear: take the lane that keeps us furthest away
+                lane = None
+                for lanes_try in sides:
+                    lane = choose_lane(boxes, cross, lanes_try, hw, zh, self.plan_dist,
+                                       self.pass_margin, side_ok, self.left_bias, lane_free)
+                    if lane is not None:
+                        break
+                    
+                # about to be hit and no lane is completely clear: take the least bad one, but on ALL lanes
                 if lane is None and urgent and preds:
-                    gaps = {L: min_gap(preds, cross - L, 0.0, lat_v, self.mv_hw, zh, self.mv_horizon) for L in lanes}
+                    all_lanes = self.lanes
+                    gaps = {L: min_gap(preds, cross - L, 0.0, lat_v, self.mv_hw, zh, self.mv_horizon)
+                            for L in all_lanes}
                     g_best = max(gaps.values())
                     if g_best > 0.1:
-                        lane = choose_lane(boxes, cross, lanes, hw, zh, self.plan_dist, self.pass_margin, side_ok,
-                                           self.left_bias, lambda L: gaps[L] >= g_best - 0.3)
-                
-                # found a lane different from where we are: make it the goal
-                # (the sideways move itself happens further down)
+                        lane = choose_lane(boxes, cross, all_lanes, hw, zh, self.plan_dist,
+                                           self.pass_margin, side_ok, self.left_bias,
+                                           lambda L: gaps[L] >= g_best - 0.3)
+
                 if lane is not None and abs(lane - self.off_cmd) > 1e-3:
                     if lane != 0.0:
-                        # first dodge: remember how far along the route it started
-                        if not self.dodge_side:
+                        new_side = 1.0 if lane > 0 else -1.0
+                        if new_side != self.dodge_side:
+                            # changing sides: NEW dodge. Re-anchor the along-route counter AND the committed lane.
                             self.dodge_s = s_drone
-                        self.dodge_side = 1.0 if lane > 0 else -1.0
+                            self.commit_t = now
+                        self.dodge_side = new_side
+                        # Latch / extend the commit to this lane (line-anchored).
+                        self.commit_side = new_side
+                        self.commit_lane = lane
+                    else:
+                        # returning to the line: drop the commit so the next dodge is a fresh one
+                        self.commit_side = 0.0
+                        self.commit_lane = 0.0
                     self.off_goal = lane
                     self.get_logger().info(
-                        f"Going around: moving to {lane:+.1f} m ({'right' if lane > self.off_cmd else 'left'}) of the line.")
-                # no lane is available
-                elif lane is None:
-                    no_lane = urgent
-                    # after waiting a bit longer, let it consider the other side too; otherwise keep waiting and log why
-                    if self.dodge_side and now - self.block_t0 > self.pause_time + 6.0:
-                        self.dodge_side = 0.0
-                        self.get_logger().info("Nothing further out on that side: considering the other side too.")
-                    else:
-                        self._log_every(now, 5.0, "No clear lane yet. " + self._why_no_lane(now))
+                        f"Going around: moving to {lane:+.1f} m "
+                        f"({'right' if lane > self.off_cmd else 'left'}) of the line.")
+    
             # CASE 2: not blocked and we are off the line: go back to the line once we are far enough past
             # the obstacle (min_pass), or the carrot has already reached the end of the leg
             elif not blocked and abs(self.off_cmd) > 1e-3 and (s_drone - self.dodge_s >= self.min_pass or self.leg_done):
@@ -1311,12 +1568,15 @@ class WaypointFollower(Node):
                 lane = choose_lane(boxes, cross, [0.0], hw, zh, self.plan_dist, self.pass_margin, side_ok, 0.0, lane_free)
                 if lane is not None:
                     self.off_goal = 0.0
+                    self.commit_lane = 0.0
                     self.get_logger().info("Clear of the obstacle: returning to the line.")
 
         # a moving obstacle is now predicted to hit us in the lane we are sliding to: pick another lane and keep
         # sliding (stopping half way would leave us in its path). If there is no other lane, carry on to the same one.
-        if preds and abs(self.off_goal - self.off_cmd) > 1e-3 and now - self.mv_replan_t >= self.mv_replan_gap and \
-                first_conflict(preds, cross - self.off_goal, 0.0, lat_v, self.mv_hw, zh, self.mv_horizon,
+        gap = 0.2 if urgent else self.mv_replan_gap
+        _check = near_preds or preds
+        if _check and abs(self.off_goal - self.off_cmd) > 1e-3 and now - self.mv_replan_t >= gap and \
+                first_conflict(_check, cross - self.off_goal, 0.0, lat_v, self.mv_hw, zh, self.mv_horizon,
                                v_after=v_after, soft_slide=True) is not None:
             # try lanes further out on the SAME side first (no wobbling across the obstacle's path),
             # and only if none of those is safe, try every lane
@@ -1326,28 +1586,28 @@ class WaypointFollower(Node):
                 alt = choose_lane(boxes, cross, self.lanes, hw, zh, self.plan_dist, self.pass_margin, side_ok, self.left_bias, lane_free)
             if alt is not None and abs(alt - self.off_goal) > 1e-3:
                 self.off_goal = alt
+                self.commit_side = 1.0 if alt > 0 else (-1.0 if alt < 0 else 0.0)
+                self.commit_lane = alt
                 self.mv_replan_t = now
                 self.get_logger().info(f"Moving obstacle: changing the sideways move to {alt:+.1f} m.")
-        if abs(self.off_goal - self.off_cmd) > 1e-3:   # a sideways move is under way: check it every tick
+        if abs(self.off_goal - self.off_cmd) > 1e-3:
             d = self.off_goal - self.off_cmd
             sgn = 1.0 if d > 0 else -1.0
-            y_c = -sgn * min(abs(d), 2.0)
-            # is anything in the way of the next ~2 m of sideways move (or just behind us)?
-            hit = first_hit_x(boxes, -self.pass_margin, hw, min(0.0, y_c) - hw, max(0.0, y_c) + hw, zh)
-            # something appeared, or that side's camera stopped: cancel the move
+            hit = self._slide_path_clear(boxes, cross, self.off_cmd, self.off_goal, hw, zh)
             if not side_ok(sgn) or hit < math.inf:
                 self.off_goal = self.off_cmd
                 self.get_logger().warn("Sideways move blocked: stopping and re-planning.")
             else:
-                # otherwise slide sideways a little (lat_speed, per tick)
                 self.off_cmd += sgn * min(abs(d), lat_v * dt)
-
+        
         # the sideways move is finished and nothing is about to hit us: back to the calm sideways speed
-        if not urgent and abs(self.off_goal - self.off_cmd) <= 1e-3:
+        if abs(self.off_goal - self.off_cmd) <= 1e-3 and not self.evading_ids:
             self.evading = False
         # back on the line and not blocked: forget which side we were dodging
         if abs(self.off_cmd) < 1e-3 and abs(self.off_goal) < 1e-3 and not blocked:
             self.dodge_side = 0.0
+            self.commit_side = 0.0
+            self.commit_lane = 0.0
         # scale = forward speed from 0 (stop) to 1 (full). It fades from full at slow_dist down to 0 at
         # stop_dist, and is 0 whenever we are blocked.
         scale = 1.0
@@ -1359,31 +1619,130 @@ class WaypointFollower(Node):
         scale = min(scale, mv_scale)
         # about to be hit, hovering would not help and there is no lane to dodge into: back away along the route
         self.accel_now = self.accel
+        self.jerk_now = self.jerk
+        fleeing = False
+
         if no_lane and urgent and self.mv_retreat > 0 and abs(self.off_goal - self.off_cmd) <= 1e-3:
-            # v7: already level with the thing (inside its slab along the route): backing away would keep us in its
-            # path, so run FORWARD out of it (if nothing standing is close ahead). Otherwise back away as before.
-            inside = any(abs(cy) < hy + pad0 + self.mv_hw + 0.5 and cx - hx - pad0 - self.mv_hw < 0.3 and cx + hx + pad0 + self.mv_hw > 0.0
-                         for cx, cy, hx, hy, z0, z1, vx, vy, pad0, growth in preds if not (z1 < -zh or z0 > zh))
-            if inside and fx > 3.0:
-                scale = 1.0
-                self.accel_now = max(self.accel, 2.0)
-                self._log_every(now, 2.0, "Moving obstacle is level with us: leaving its path forward.")
-            else:
+            head_on = any((vx < -0.3 or vx > 0.3) and abs(vx) > 0.7 * math.hypot(vx, vy)
+                          and not (z1 < -zh or z0 > zh)
+                          for cx, cy, hx, hy, z0, z1, vx, vy, pad0, growth in preds)
+            # retreat is only allowed if BACKING UP is itself clear of every other mover
+            retreat_safe = first_conflict(preds, cross - self.off_goal, -self.mv_retreat, lat_v,
+                                          self.mv_hw, zh, self.mv_horizon,
+                                          v_after=None, slack=0.0, soft_slide=True) is None
+            if head_on and retreat_safe:
                 scale = -min(1.0, self.mv_retreat / self.speed)
-                self._log_every(now, 2.0, "No lane to dodge into: backing away from the moving obstacle.")
-        # v7 STANDOFF: never hover right next to something. Too close to a standing obstacle, a moving one or a sway
-        # stripe straight ahead -> back away along the route (if the camera behind is running and the way back is clear).
-        too_close = fx < self.standoff
+                self.jerk_now = self.jerk_emergency
+                self._log_every(now, 2.0, "Head-on mover with no lane: backing away.")
+            elif head_on and not retreat_safe:
+                # retreat would fly us into the OTHER mover: pick the least-bad lane instead, even if its gap is tiny
+                self._log_every(now, 2.0, "Head-on mover but retreat is unsafe: choosing least-bad lane.")
+                # least-bad lane search (mirrors the earlier gaps block)
+                gaps = {L: min_gap(preds, cross - L, 0.0, lat_v, self.mv_hw, zh, self.mv_horizon)
+                        for L in self.lanes}
+                g_best = max(gaps.values())
+                if g_best > -0.5:  # a lane that at least barely avoids contact
+                    best_lane = max(gaps, key=gaps.get)
+                    self.off_goal = best_lane
+                    self.commit_side = 1.0 if best_lane > 0 else (-1.0 if best_lane < 0 else 0.0)
+                    self.commit_lane = best_lane
+                    self.dodge_side = self.commit_side
+                    scale = 0.0
+                    self.jerk_now = self.jerk
+                else:
+                    # truly boxed in: hold still (standoff logic below may act)
+                    scale = 0.0
+                    self.jerk_now = self.jerk
+            else:
+                scale = 0.0
+                self.jerk_now = self.jerk
+                self._log_every(now, 2.0, "Sideways mover with no lane: holding.")
+                    
+        # ---- v7.2 STANDOFF: a debounced HOLD, never a reverse. ----
+        # g = clearance to the nearest REAL thing ahead: standing boxes and the predicted body of
+        # movers / sway stripes (NOT the padded hold boxes; those only stop us). Reversal is not
+        # done here: that is Path A's job (urgent + no lane), which is the only source of negative
+        # forward speed. This block's only job is to hold still when something is genuinely close,
+        # with hysteresis AND a dwell time so it cannot chatter tick-to-tick.
+        g = min(first_hit_x(core_boxes, 0.3, self.slow_dist, -hw, hw, zh),
+                self._hold_gap(now) if self.mv_on else math.inf)
         for cx, cy, hx, hy, z0, z1, vx, vy, pad0, growth in preds:
             if z1 < -zh or z0 > zh or cx < -0.2 or abs(cy) >= hy + pad0 + self.mv_hw:
                 continue
-            if cx - hx - pad0 - self.mv_hw < self.mv_standoff:
-                too_close = True
-        self.lead_now = 0.0 if (too_close or self.fx < self.stop_dist or preds) else self.brake_lead
-        if too_close and self.mv_retreat > 0 and scale >= -1e-9 and (self._alive("back", now) or self.allow_blind) \
-                and first_hit_x(boxes, -3.0, -0.2, -hw, hw, zh) == math.inf:
-            scale = -min(1.0, self.mv_retreat / self.speed)
-            self._log_every(now, 2.0, "Too close to an obstacle ahead: backing away to keep a safe distance.")
+            g = min(g, max(0.0, cx - hx - 0.3))     # predicted body only (no padding)
+
+        enter, leave = self.standoff, self.standoff + self.standoff_release
+
+        dodging = abs(self.off_goal - self.off_cmd) > 1e-3
+        # "stalled" = we were dodging but the slide has not progressed for >0.2 s, so standoff should own the response
+        stalled = dodging and abs(self.off_cmd - getattr(self, "_last_off_cmd", self.off_cmd)) < 1e-3
+        self._stalled_since = getattr(self, "_stalled_since", None) or (now if stalled else None)
+        if not stalled:
+            self._stalled_since = None
+        slide_stalled = stalled and (now - (self._stalled_since or now)) > 0.2
+        self._last_off_cmd = self.off_cmd
+
+        standoff_may_act = ((not dodging) or slide_stalled) and (not urgent) and (not fleeing) and (not self.evading)
+
+        if standoff_may_act:
+            # debounce the transitions
+            if g < enter:
+                self.standoff_t_leave = None
+                if self.standoff_t_enter is None:
+                    self.standoff_t_enter = now
+            elif g >= leave:
+                self.standoff_t_enter = None
+                if self.standoff_t_leave is None:
+                    self.standoff_t_leave = now
+            else:
+                # inside the hysteresis band: hold whichever state we were in, reset the other timer
+                self.standoff_t_leave = None if self.retreat_latched else self.standoff_t_leave
+
+            # latch only after the gap stayed below 'enter' for standoff_dwell seconds
+            if (self.standoff_t_enter is not None
+                    and now - self.standoff_t_enter >= self.standoff_dwell):
+                if not self.retreat_latched:
+                    self.retreat_s0 = s_drone
+                self.retreat_latched = True
+                self.jerk_now = self.jerk_emergency
+            # release only after the gap stayed above 'leave' for standoff_exit seconds
+            if (self.retreat_latched and self.standoff_t_leave is not None
+                    and now - self.standoff_t_leave >= self.standoff_exit):
+                self.retreat_latched = False
+                self.standoff_t_leave = None
+                self.retreat_s0 = None
+        else:
+            # something else is handling it: clear our timers so we start fresh next time we own it
+            self.standoff_t_enter = None
+            self.standoff_t_leave = None
+
+        if self.fx < self.stop_dist and self.v > 0.3:    # already inside the planned stopping distance and still moving: brake hard
+            self.jerk_now = self.jerk_emergency
+        self.lead_now = 0.0 if (g < leave or self.fx < self.stop_dist or preds) else self.brake_lead
+        if scale > 0.0 and g < leave + 1.0 and not fleeing:       # forward speed fades to zero as the room runs out
+            scale = min(scale, max(0.0, (g - leave) / 1.0))
+
+        # STANDOFF HOLDS STILL, IT DOES NOT REVERSE.
+        if self.retreat_latched and standoff_may_act:
+            scale = 0.0
+            self._log_every(now, 2.0, f"Too close to an obstacle ({g:.1f} m): holding still.")
+            if self.retreat_s0 is not None:
+                backed = self.retreat_s0 - s_drone
+                if backed >= self.retreat_max:
+                    self.retreat_latched = False
+                    self.retreat_s0 = None
+
+        if need_room:
+            if self.room_s0 is None:
+                self.room_s0 = s_drone
+            room_behind = (self._alive("back", now) or self.allow_blind) and \
+                first_hit_x(core_boxes, -3.0, -0.2, -hw, hw, zh) == math.inf
+            if room_behind and self.room_s0 - s_drone < self.retreat_max:
+                scale = -min(1.0, self.standoff_retreat_speed / self.speed)
+                self.jerk_now = self.jerk
+                self._log_every(now, 2.0, f"Too close to sidestep ({fx:.1f} m): backing off to make room.")
+        else:
+            self.room_s0 = None
         return scale, False
 
     def _avoid_rth(self, now, dt, cross, s_drone):
@@ -1449,6 +1808,7 @@ class WaypointFollower(Node):
         self.seg_start = self.pos.copy()
         self.carrot_s = 0.0
         self.v = 0.0
+        self.acc_cmd = 0.0
         self.off_cmd = self.off_goal = 0.0
         self.dodge_side = 0.0
         self.mem = []
@@ -1594,17 +1954,29 @@ class WaypointFollower(Node):
             self.complete_t = now
             self.mission_pub.publish(String(data=self.complete_msg))
 
-    # ------------------------------------------------------------------ main loop
-    # Runs rate_hz times a second. The dashboard code can never be allowed to stop the flight code.
+    # ------------------------ main loop ------------------------
     def on_timer(self):
-        self._tick()
+        import time
+        t0 = time.perf_counter()
         try:
-            self._mission_tick(self._now())
-        except Exception as e:
-            self._log_every(self._now(), 5.0, f"Dashboard status error: {e!r}")
-
+            self._on_timer_body()
+            try:                      # dashboard status: it can never be allowed to stop the flight code
+                self._mission_tick(self._now())
+            except Exception as e:
+                self._log_every(self._now(), 5.0, f"Dashboard status error: {e!r}")
+        finally:
+            dur = time.perf_counter() - t0
+            self._tick_durs.append(dur)
+            if len(self._tick_durs) >= int(self.rate_hz * 5):   # every ~5 s
+                a = np.array(self._tick_durs)
+                self.get_logger().info(
+                    f"TICK {1000*a.mean():.1f} ms mean, {1000*np.percentile(a,95):.1f} ms p95, "
+                    f"{1000*a.max():.1f} ms max, n={len(a)}, "
+                    f"tracks={len(self.mtracks)}")
+                self._tick_durs = []
+    
     # The main loop. Runs rate_hz times a second; does the job of the current state, then returns.
-    def _tick(self):
+    def _on_timer_body(self):
         now = self._now()
         # dt = seconds since the last tick (kept between 0 and 0.2 so a hiccup cannot cause a big jump)
         dt = 0.0 if self.t_last is None else min(max(now - self.t_last, 0.0), 0.2)
@@ -1694,15 +2066,16 @@ class WaypointFollower(Node):
 
             s_drone = float((self.pos - self.seg_start) @ d3) if length > 1e-6 else 0.0
             # SPEED: speed up at 'accel' (gently) or slow down at 'decel' (quickly), aiming for speed * scale
-            dv = self.speed * scale - self.v
-            self.v += max(-self.decel * dt, min(self.accel_now * dt, dv))
+            self._step_speed(self.speed * scale, dt)
             # MOVE THE CARROT forward, but only if it is not already more than max_lead ahead of the drone
             if length > 1e-6 and (self.carrot_s - s_drone) < self.max_lead:
                 self.carrot_s = min(self.carrot_s + self.v * dt, length)
                 if self.v < 0:      # backing away: the carrot must not run off behind the drone or before the start of the leg
                     self.carrot_s = max(self.carrot_s, 0.0, s_drone - self.max_lead)
             if scale <= 0.0 and length > 1e-6:    # blocked: stop the carrot at the drone
-                self.carrot_s = min(self.carrot_s, max(s_drone, 0.0) + self.lead_now)
+                lim = max(s_drone, 0.0) + self.lead_now
+                if self.carrot_s > lim:
+                    self.carrot_s = max(lim, self.carrot_s - self.carrot_slew * dt)
             # carrot position: along the line, then shifted sideways by the lane offset
             base = self.seg_start + d3 * self.carrot_s if length > 1e-6 else target.copy()
             carrot = base + r * self.off_cmd
@@ -1780,6 +2153,8 @@ class WaypointFollower(Node):
                 self.rth_t0 = now
                 
             if now - self.rth_t0 < 2.0:
+                if self.mv_on:
+                    self.det_buf = []
                 self.publish_heartbeat()
                 self.publish_setpoint(self.pos.copy(), self.hold_yaw)
                 self._log_every(now, 1.0, "RTH: turning around...")
@@ -1814,14 +2189,15 @@ class WaypointFollower(Node):
                 scale = 1.0
 
             s_drone = float((self.pos - self.seg_start) @ d3) if length > 1e-6 else 0.0
-            dv = self.speed * scale - self.v
-            self.v += max(-self.decel * dt, min(self.accel_now * dt, dv))
+            self._step_speed(self.speed * scale, dt)
             if length > 1e-6 and (self.carrot_s - s_drone) < self.max_lead:
                 self.carrot_s = min(self.carrot_s + self.v * dt, length)
                 if self.v < 0:      # backing away: the carrot must not run off behind the drone or before the start of the leg
                     self.carrot_s = max(self.carrot_s, 0.0, s_drone - self.max_lead)
             if scale <= 0.0 and length > 1e-6:
-                self.carrot_s = min(self.carrot_s, max(s_drone, 0.0) + self.lead_now)
+                lim = max(s_drone, 0.0) + self.lead_now
+                if self.carrot_s > lim:
+                    self.carrot_s = max(lim, self.carrot_s - self.carrot_slew * dt)
             base = self.seg_start + d3 * self.carrot_s if length > 1e-6 else target.copy()
             carrot = base + r * self.off_cmd
 
